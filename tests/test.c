@@ -187,8 +187,17 @@ char* validate_write_fills () {
 }
 
 char* validate_stat (){
+	int fd = open("test_stat.txt", O_CREAT | O_WRONLY);
+	if (fd < 0) {
+		return "open fd < 0";
+	}
+	int ret = close(fd);
+	if (ret != 0) {
+		return "close return error";
+	}
+
 	struct stat s;
-	int ret = stat("test", &s);
+	ret = stat("test_stat.txt", &s);
 	if (ret < 0) {
 		return "stat ret < 0";
 	}

@@ -36,9 +36,9 @@ if ! mount -t sfs /dev/vda /mnt/sfs; then
 fi
 
 # Test-suite call
-if [ -x /tests/run_tests ]; then
+if [ -x tests/run_tests ]; then
     echo "[init] running test suite"
-    /tests/run_tests /mnt/sfs
+    tests/run_tests /mnt/sfs
     TEST_STATUS=$?
     echo "[init] test suite exit code: $TEST_STATUS"
 else

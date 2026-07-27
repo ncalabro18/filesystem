@@ -37,6 +37,9 @@ struct sfs_mount_config {
 /* helpers */
 static struct inode* sfs_lookup_inode(struct super_block *sb, unsigned int inode_number);
 struct sfs_super* sfs_get_super (struct super_block *sb);
+static int sfs_read_disk_inode(struct super_block *sb, unsigned int ino, struct sfs_inode *out);
+static int sfs_write_disk_inode(struct super_block *sb, unsigned int ino, struct sfs_inode *in);
+static sector_t sfs_data_block_for_inode(struct super_block *sb, unsigned int ino);
 
 /* inode_operation callbacks */
 static struct dentry* sfs_lookup (struct inode *, struct dentry *, unsigned int);
@@ -48,21 +51,11 @@ static int sfs_rmdir (struct inode *,struct dentry *);
 static int sfs_init_fs_context(struct fs_context *fc);
 static int sfs_get_tree(struct fs_context *fc);
 
-/* file_system_type operations */
-//static struct dentry* sfs_mount (struct file_system_type *fst, int, const char *dev_name, void *data);
-
-// void sfs_free_fs(struct fs_context *fc);
-
 /* callback to mount_bdev */
 int sfs_fill_super(struct super_block *sb, struct fs_context *fc);
 
 /* file_operations callbacks */
-static int     sfs_fop_open   (struct inode *, struct file *);
-//static int   sfs_fop_release(struct inode *, struct file *);
-static ssize_t sfs_fop_read   (struct file *, char *, size_t, loff_t *);
-static ssize_t sfs_fop_write  (struct file *, const char *, size_t, loff_t *);
 static int     sfs_dop_iterate_shared (struct file *, struct dir_context *);
-
 
 /* super_operation callbacks */
 static void sfs_put_super (struct super_block *);
@@ -77,11 +70,6 @@ static int sfs_write_pages (struct address_space *, struct writeback_control *);
 
 static int sfs_get_block   (struct inode *inode, sector_t iblock,
 				struct buffer_head *bh_result, int create);
-
-/* helpers / libc */
-int strnequal(const char *s1, const char *s2, size_t n);
-
-
 
 
 /*** table structures to hold sfs callback functions ***/
@@ -175,7 +163,6 @@ int sfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	struct sfs_mount_config *config = (struct sfs_mount_config*) sb->s_fs_info;
 	init_rwsem(&config->lock);
 
-	// copy superblock data into config so callers don't need to re-read block 0
 	memcpy(&config->super, disk_super, sizeof(struct sfs_super));
 	brelse(bh);
 
@@ -185,12 +172,16 @@ int sfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	struct inode *root = sfs_lookup_inode(sb, 0);
 	if (IS_ERR(root)) {
 		printk("sfs_fill_super: lookup_inode error %ld\n", PTR_ERR(root));
+		kfree(sb->s_fs_info);
+		sb->s_fs_info = NULL;
 		return PTR_ERR(root);
 	}
 
 	sb->s_root = d_make_root(root);
 	if (sb->s_root == NULL) {
 		printk("sfs_fill_super: d_make_root NULL\n");
+		kfree(sb->s_fs_info);
+		sb->s_fs_info = NULL;
 		return -ENOMEM;
 	}
 
@@ -208,53 +199,113 @@ static int sfs_get_tree(struct fs_context *fc)
 	return get_tree_bdev(fc, sfs_fill_super);
 }
 
-
-// void sfs_free_fs(struct fs_context *fc) {
-// return}
-
 /*** super_operation callback definitions ***/
 
 static void sfs_put_super (struct super_block *sb) {
 	kfree(sb->s_fs_info);
 }
+
 static int sfs_write_inode
 	(struct inode *in, struct writeback_control *wbc) {
 
 	struct sfs_mount_config *config = (struct sfs_mount_config*) in->i_sb->s_fs_info;
+	struct sfs_inode disk_ino;
 
-	down_read(&config->lock);
-	/*  being critical section  */
+	down_write(&config->lock);
 
-	sector_t block = 1 + in->i_ino;
-	struct buffer_head *bhead = sb_bread(in->i_sb, block);
-	if (bhead == NULL) {
-		up_read(&config->lock);
-		sfs_error_printk("sfs_write_inode: sb_bread NULL return\n");
-		return -EINVAL;
+	if (sfs_read_disk_inode(in->i_sb, in->i_ino, &disk_ino)) {
+		up_write(&config->lock);
+		sfs_error_printk("sfs_write_inode: read_disk_inode failed\n");
+		return -EIO;
 	}
 
-	struct sfs_inode *sfsnode = (struct sfs_inode*) bhead->b_data;
+	disk_ino.file_size = cpu_to_le64(i_size_read(in));
 
-	sfsnode->file_size = cpu_to_le64(i_size_read(in));
-
-	/* prevents reading old values from cache */
-	mark_buffer_dirty(bhead);
-
-	if (wbc->sync_mode == WB_SYNC_ALL) {
-		int ret = sync_dirty_buffer(bhead);
-		if (ret != 0) {
-			up_read(&config->lock);
-			brelse(bhead);
-			sfs_error_printk("sfs_write_inode: sync_dirty_buffer error\n");
-			return ret;
-		}
+	if (sfs_write_disk_inode(in->i_sb, in->i_ino, &disk_ino)) {
+		up_write(&config->lock);
+		sfs_error_printk("sfs_write_inode: write_disk_inode failed\n");
+		return -EIO;
 	}
 
-	brelse(bhead);
-
-	/*   end critical section   */
-	up_read(&config->lock);
+	up_write(&config->lock);
 	return 0;
+}
+
+/*
+ * Reads/writes a single on-disk sfs_inode struct at the given inode index.
+ * Handles the entry straddling a block boundary generically rather than
+ * requiring the metadata table to be block-aligned.
+ */
+static int sfs_read_disk_inode(struct super_block *sb, unsigned int ino, struct sfs_inode *out) {
+	unsigned int off = sizeof(struct sfs_super) + ino * sizeof(struct sfs_inode);
+	unsigned int remaining = sizeof(struct sfs_inode);
+	char *dst = (char *) out;
+
+	while (remaining) {
+		sector_t block = off / sb->s_blocksize;
+		unsigned int block_off = off % sb->s_blocksize;
+		unsigned int chunk = min_t(unsigned int, remaining, sb->s_blocksize - block_off);
+
+		struct buffer_head *bh = sb_bread(sb, block);
+		if (bh == NULL)
+			return -EIO;
+
+		memcpy(dst, bh->b_data + block_off, chunk);
+		brelse(bh);
+
+		dst += chunk;
+		off += chunk;
+		remaining -= chunk;
+	}
+	return 0;
+}
+
+static int sfs_write_disk_inode(struct super_block *sb, unsigned int ino, struct sfs_inode *in) {
+	unsigned int off = sizeof(struct sfs_super) + ino * sizeof(struct sfs_inode);
+	unsigned int remaining = sizeof(struct sfs_inode);
+	const char *src = (const char *) in;
+
+	while (remaining) {
+		sector_t block = off / sb->s_blocksize;
+		unsigned int block_off = off % sb->s_blocksize;
+		unsigned int chunk = min_t(unsigned int, remaining, sb->s_blocksize - block_off);
+
+		struct buffer_head *bh = sb_bread(sb, block);
+		if (bh == NULL)
+			return -EIO;
+
+		memcpy(bh->b_data + block_off, src, chunk);
+		mark_buffer_dirty(bh);
+		brelse(bh);
+
+		src += chunk;
+		off += chunk;
+		remaining -= chunk;
+	}
+	return 0;
+}
+
+/*
+ * Regular files get one fixed SFS_MAX_FILE_SIZE-byte slot each, located
+ * after the (superblock + inode metadata table) region. Directories never
+ * call this - their "contents" are derived by scanning parent_dir fields.
+ */
+static sector_t sfs_data_block_for_inode(struct super_block *sb, unsigned int ino) {
+	struct sfs_super *s = sfs_get_super(sb);
+	__u64 max_dirs = le64_to_cpu(s->max_dirs);
+	__u64 max_files = le64_to_cpu(s->max_files);
+	__u64 total_inodes = max_dirs + max_files;
+
+	unsigned int metadata_bytes = sizeof(struct sfs_super) +
+		total_inodes * sizeof(struct sfs_inode);
+	sector_t data_start_block = DIV_ROUND_UP(metadata_bytes, sb->s_blocksize);
+
+	unsigned int blocks_per_file = SFS_MAX_FILE_SIZE / sb->s_blocksize;
+	if (blocks_per_file == 0)
+		blocks_per_file = 1;
+
+	unsigned int file_index = ino - max_dirs;
+	return data_start_block + (sector_t) file_index * blocks_per_file;
 }
 
 static struct inode* sfs_lookup_inode
@@ -265,9 +316,15 @@ static struct inode* sfs_lookup_inode
 		return NULL;
 	}
 
-	if (node->i_state == I_NEW) {
+	if (node->i_state & I_NEW) {
 		struct sfs_mount_config *config = (struct sfs_mount_config *) sb->s_fs_info;
 		__u64 max_dirs = le64_to_cpu(config->super.max_dirs);
+		struct sfs_inode disk_ino;
+
+		if (sfs_read_disk_inode(sb, inode_number, &disk_ino)) {
+			iget_failed(node);
+			return ERR_PTR(-EIO);
+		}
 
 		node->i_ino = inode_number;
 
@@ -275,98 +332,16 @@ static struct inode* sfs_lookup_inode
 			node->i_mode = S_IFDIR | 0755;
 			node->i_op = &sfs_dir_inode_operations;
 			node->i_fop = &sfs_directory_operations;
+			set_nlink(node, 2);
 		} else {
 			node->i_mode = S_IFREG | 0644;
 			node->i_op = &sfs_file_inode_operations;
 			node->i_fop = &sfs_file_operations;
 			node->i_mapping->a_ops = &sfs_address_space_operations;
+			i_size_write(node, le64_to_cpu(disk_ino.file_size));
+			set_nlink(node, 1);
 		}
 
-		/* unset the state */
-		unlock_new_inode(node);
-	}
-
-	return node;
-}
-
-static struct inode* sfs_lookup_empty_inode
-	(struct super_block *sb, unsigned int inode_number) {
-
-	struct inode* node = iget_locked(sb, inode_number);
-	if (node == NULL) {
-		sfs_error_printk("sfs_lookup_empty_inode : iget_locked NULL return\n");
-		return NULL;
-	}
-
-	struct buffer_head *bh = sb_bread(sb, 0);
-	if (bh == NULL) {
-		sfs_error_printk("sfs_lookup_empty_inode : sb_bread NULL return\n");
-		return ERR_PTR(-EINVAL);
-	}
-	struct sfs_super *s = (struct sfs_super*) bh->b_data;
-	
-	if (node->i_state == I_NEW) {
-		node->i_ino = inode_number;
-		node->i_mapping->a_ops = &sfs_address_space_operations;
-		node->i_fop = &sfs_file_operations;
-
-		node->i_mode = 0777;
-		// todo check if directory or not
-		if (inode_number <= s->max_dirs) {
-			/* directory */
-			node->i_mode |= S_IFDIR;
-			node->i_op = &sfs_dir_inode_operations;
-
-
-		} else {
-			/* regular file */
-			node->i_mode |= S_IFREG;
-			node->i_op = &sfs_file_inode_operations;
-
-		}
-
-
-		/* unset the new state */
-		// node->i_state &= ~(I_NEW);
-		unlock_new_inode(node);
-	}
-	return node;
-}
-
-static struct inode* sfs_lookup_sfs_inode(struct super_block *sb, unsigned int inode_number) {
-
-	struct inode* node = iget_locked(sb, inode_number);
-	if (node == NULL) {
-		sfs_error_printk("sfs_lookup_sfs_inode: iget_locked NULL return\n");
-		return NULL;
-	}
-
-	struct sfs_super *s = sfs_get_super(sb);
-	if (s == NULL) {
-		sfs_error_printk("sfs_lookup_sfs_inode: sfs_get_super returned NULL\n");
-		return ERR_PTR(-EINVAL);
-	}
-	
-	if (node->i_state == I_NEW) {
-		node->i_ino = inode_number;
-		node->i_op = &sfs_file_inode_operations;
-		node->i_mapping->a_ops = &sfs_address_space_operations;
-		node->i_fop = &sfs_file_operations;
-
-		node->i_mode = 0777;
-		// todo check if directory or not
-		if (inode_number <= s->max_dirs) {
-			/* directory */
-			node->i_mode |= S_IFDIR;
-
-		} else {
-			/* regular file */
-			node->i_mode |= S_IFREG;
-		}
-		
-
-		/* unset the new state */
-		// node->i_state &= ~(I_NEW);
 		unlock_new_inode(node);
 	}
 
@@ -375,69 +350,181 @@ static struct inode* sfs_lookup_sfs_inode(struct super_block *sb, unsigned int i
 
 /* file_operations callbacks definitions */
 
-static int     sfs_fop_open   (struct inode *, struct file *) {
+static int     sfs_dop_iterate_shared (struct file *file, struct dir_context *ctx) {
+	struct inode *dir = file_inode(file);
+	struct sfs_super *s = sfs_get_super(dir->i_sb);
+	__u64 total = le64_to_cpu(s->max_dirs) + le64_to_cpu(s->max_files);
+	__u64 i;
+
+	if (!dir_emit_dots(file, ctx))
+		return 0;
+
+	/* ctx->pos starts at 2 after dir_emit_dots; map pos-2 to inode index */
+	for (i = ctx->pos - 2; i < total; i++, ctx->pos++) {
+		struct sfs_inode disk_ino;
+		unsigned int namelen;
+		unsigned char type;
+
+		if (sfs_read_disk_inode(dir->i_sb, i, &disk_ino))
+			continue;
+		if (disk_ino.name[0] == '\0')
+			continue;
+		if (le64_to_cpu(disk_ino.parent_dir) != dir->i_ino)
+			continue;
+
+		namelen = strnlen(disk_ino.name, sizeof(disk_ino.name));
+		type = (i < le64_to_cpu(s->max_dirs)) ? DT_DIR : DT_REG;
+
+		if (!dir_emit(ctx, disk_ino.name, namelen, i, type))
+			return 0;
+	}
 	return 0;
-}
-
-//static int     sfs_fop_release(struct inode *, struct file *);
-static ssize_t sfs_fop_read   (struct file *, char *, size_t, loff_t *);
-static ssize_t sfs_fop_write  (struct file *, const char *, size_t, loff_t *);
-
-static int     sfs_dop_iterate_shared (struct file *, struct dir_context *context) {
-	//for (context.pos = 0; context.pos <
-	sfs_error_printk("sfs_dop_iterate_shared unimp\n");
-	return -1;
 }
 
 /* inode_operation callback definitions */
 
-static struct dentry* sfs_lookup(struct inode *node, struct dentry *entry, unsigned int num) {
-    struct sfs_super *s = sfs_get_super(node->i_sb);
+static struct dentry* sfs_lookup(struct inode *dir, struct dentry *entry, unsigned int flags) {
+	struct sfs_super *s = sfs_get_super(dir->i_sb);
+	__u64 total = le64_to_cpu(s->max_dirs) + le64_to_cpu(s->max_files);
+	struct inode *found = NULL;
+	__u64 i;
 
-    for (unsigned i = s->max_dirs; i < s->max_files; i++) {
-        // TODO: read inode block, compare name to entry->d_name.name
-    }
+	for (i = 0; i < total; i++) {
+		struct sfs_inode disk_ino;
+		size_t namelen = entry->d_name.len;
 
-    return d_splice_alias(NULL, entry); // NULL until lookup is implemented
+		if (sfs_read_disk_inode(dir->i_sb, i, &disk_ino))
+			continue;
+		if (disk_ino.name[0] == '\0')
+			continue;
+		if (le64_to_cpu(disk_ino.parent_dir) != dir->i_ino)
+			continue;
+
+		if (namelen > sizeof(disk_ino.name))
+			continue;
+		if (memcmp(disk_ino.name, entry->d_name.name, namelen) != 0)
+			continue;
+		/* ensure no leftover bytes after the matched name */
+		if (namelen < sizeof(disk_ino.name) && disk_ino.name[namelen] != '\0')
+			continue;
+
+		found = sfs_lookup_inode(dir->i_sb, i);
+		break;
+	}
+
+	if (IS_ERR(found))
+		return ERR_CAST(found);
+
+	return d_splice_alias(found, entry);
 }
 
-static int sfs_unlink (struct inode *node, struct dentry *de) {
-	memset(node, '\0', sizeof(struct inode));
+static int sfs_unlink (struct inode *dir, struct dentry *de) {
+	struct sfs_inode disk_ino;
+	unsigned int ino = de->d_inode->i_ino;
+
+	if (sfs_read_disk_inode(dir->i_sb, ino, &disk_ino))
+		return -EIO;
+
+	memset(&disk_ino, 0, sizeof(disk_ino));
+
+	if (sfs_write_disk_inode(dir->i_sb, ino, &disk_ino))
+		return -EIO;
+
 	return 0;
 }
 
-static struct dentry* sfs_mkdir (struct mnt_idmap *map, struct inode *node, struct dentry *d, umode_t mode) {
+static struct dentry* sfs_mkdir (struct mnt_idmap *map, struct inode *dir, struct dentry *d, umode_t mode) {
+	struct sfs_super *s = sfs_get_super(dir->i_sb);
+	__u64 max_dirs = le64_to_cpu(s->max_dirs);
+	__u64 i;
 
-	struct sfs_super *s = sfs_get_super(node->i_sb);
+	for (i = 0; i < max_dirs; i++) {
+		struct sfs_inode disk_ino;
+		struct inode *new_node;
 
-	for (unsigned int i = 0; i < s->max_dirs; i++) {
+		if (sfs_read_disk_inode(dir->i_sb, i, &disk_ino))
+			continue;
+		if (disk_ino.name[0] != '\0')
+			continue; /* slot in use */
 
+		memset(&disk_ino, 0, sizeof(disk_ino));
+		strncpy(disk_ino.name, d->d_name.name, sizeof(disk_ino.name) - 1);
+		disk_ino.parent_dir = cpu_to_le64(dir->i_ino);
+		disk_ino.file_size = 0;
+
+		if (sfs_write_disk_inode(dir->i_sb, i, &disk_ino))
+			return ERR_PTR(-EIO);
+
+		new_node = sfs_lookup_inode(dir->i_sb, i);
+		if (IS_ERR(new_node))
+			return ERR_CAST(new_node);
+
+		d_instantiate(d, new_node);
+		return NULL;
 	}
-	return NULL;
+
+	return ERR_PTR(-ENOSPC);
 }
 
-static int sfs_rmdir(struct inode *node, struct dentry *de) {
-    return 0;
+static int sfs_rmdir(struct inode *dir, struct dentry *de) {
+	struct sfs_super *s = sfs_get_super(dir->i_sb);
+	__u64 total = le64_to_cpu(s->max_dirs) + le64_to_cpu(s->max_files);
+	unsigned int target_ino = de->d_inode->i_ino;
+	__u64 i;
+
+	/* refuse to remove a non-empty directory */
+	for (i = 0; i < total; i++) {
+		struct sfs_inode disk_ino;
+
+		if (sfs_read_disk_inode(dir->i_sb, i, &disk_ino))
+			continue;
+		if (disk_ino.name[0] == '\0')
+			continue;
+		if (le64_to_cpu(disk_ino.parent_dir) == target_ino)
+			return -ENOTEMPTY;
+	}
+
+	return sfs_unlink(dir, de);
 }
 
-static int sfs_rmdir (struct inode *,struct dentry *);
-
-static int sfs_create(struct mnt_idmap *idmap, struct inode *node,
+static int sfs_create(struct mnt_idmap *idmap, struct inode *dir,
                       struct dentry *d, umode_t mode, bool excl) {
-	struct sfs_super *s = sfs_get_super(node->i_sb);
+	struct sfs_super *s = sfs_get_super(dir->i_sb);
+	__u64 max_dirs = le64_to_cpu(s->max_dirs);
+	__u64 max_files = le64_to_cpu(s->max_files);
+	__u64 i;
+
 	if (s == NULL) {
 		sfs_error_printk("sfs_create: sfs_get_super returned NULL\n");
 		return -EINVAL;
 	}
 
-	for (unsigned int i = s->max_dirs; i < s->max_files; i++) {
-		struct inode *new_node = sfs_lookup_sfs_inode(node->i_sb, i);
-		if (new_node == NULL)
+	for (i = max_dirs; i < max_dirs + max_files; i++) {
+		struct sfs_inode disk_ino;
+		struct inode *new_node;
+
+		if (sfs_read_disk_inode(dir->i_sb, i, &disk_ino))
 			continue;
-		// TODO: populate name, link dentry
-		break;
+		if (disk_ino.name[0] != '\0')
+			continue; /* slot in use */
+
+		memset(&disk_ino, 0, sizeof(disk_ino));
+		strncpy(disk_ino.name, d->d_name.name, sizeof(disk_ino.name) - 1);
+		disk_ino.parent_dir = cpu_to_le64(dir->i_ino);
+		disk_ino.file_size = 0;
+
+		if (sfs_write_disk_inode(dir->i_sb, i, &disk_ino))
+			return -EIO;
+
+		new_node = sfs_lookup_inode(dir->i_sb, i);
+		if (IS_ERR(new_node))
+			return PTR_ERR(new_node);
+
+		d_instantiate(d, new_node);
+		return 0;
 	}
-	return 0;
+
+	return -ENOSPC;
 }
 
 
@@ -448,8 +535,8 @@ static int sfs_read_folio  (struct file *s, struct folio *fio) {
 	if (ret != 0)
 		sfs_error_printk("sfs_read_folio: block_read_full_folio non 0 return\n");
 	return ret;
-
 }
+
 static int sfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
                      loff_t pos, unsigned int len,
                      struct folio **foliop, void **fsdata) {
@@ -468,17 +555,16 @@ static int sfs_write_pages (struct address_space *as, struct writeback_control *
 	return ret;
 }
 
-/* callback to sfs_read_folio */
+/* callback to sfs_read_folio / sfs_write_begin */
 static int sfs_get_block (struct inode *inode, sector_t iblock,
 				struct buffer_head *bh_result, int create) {
 
-	int sector_number = (inode->i_ino * SFS_MAX_FILE_SIZE)
-			/ SFS_SECTOR_SIZE; // 512
+	sector_t block = sfs_data_block_for_inode(inode->i_sb, inode->i_ino) + iblock;
 
-	map_bh(bh_result, inode->i_sb, sector_number + iblock);
+	map_bh(bh_result, inode->i_sb, block);
 
 	if (create)
-		set_buffer_new (bh_result);
+		set_buffer_new(bh_result);
 
 	return 0;
 }
@@ -490,16 +576,6 @@ struct sfs_super* sfs_get_super(struct super_block *sb) {
 	if (config == NULL)
 		return NULL;
 	return &config->super;
-}
-
-int strnequal(const char *s1, const char *s2, size_t n) {
-	for (int i = 0; i < n; i++) {
-		if (s1[i] == s2[i]) {
-			continue;
-		} else
-			return 0;
-	}
-	return 1;
 }
 
 /*** Module callbacks and setup ***/
@@ -518,5 +594,3 @@ static void __exit exit_sfs_fs(void) {
 
 module_init(init_sfs_fs)
 module_exit(exit_sfs_fs)
-
-

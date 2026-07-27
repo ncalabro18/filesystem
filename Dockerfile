@@ -1,4 +1,5 @@
 
+### BUILD ROOT STAGE ###
 FROM ubuntu:24.04 AS buildroot-stage
 
 RUN apt update && apt install -y \
@@ -35,26 +36,14 @@ COPY board/sfs/overlay board/sfs/overlay
 
 RUN chmod +x board/sfs/overlay/init
 
-# Cross-compile the test binary and drop it into the overlay *before*
-# Buildroot's make runs - BR2_ROOTFS_OVERLAY copies the overlay tree
-# into the rootfs as part of the build, so the binary just needs to
-# physically exist on disk at this path first. Static, no PIE: /init
-# execs this directly with no dynamic loader available in the guest.
-COPY tests/test.c /tmp/test.c
-RUN mkdir -p board/sfs/overlay/tests && \
-    riscv64-linux-gnu-gcc -gdwarf-5 -static -o board/sfs/overlay/tests/run_tests /tmp/test.c && \
-    chmod +x board/sfs/overlay/tests/run_tests
 
 RUN make sfs_riscv64_defconfig
 RUN FORCE_UNSAFE_CONFIGURE=1 make -j$(nproc)
 
 
-# Output of interest:
-#   output/images/Image            (riscv64 kernel)
-#   output/images/rootfs.cpio.gz   (initramfs)
 
-
-# Final stage: just QEMU + the built artifacts needed for the module,
+### FINAL STAGE ###
+# Just QEMU + the built artifacts needed for the module,
 # so the image used for `docker run` is lighter than the Buildroot
 # build stage (which uses in a full toolchain build).
 FROM ubuntu:24.04
@@ -82,6 +71,11 @@ COPY --from=buildroot-stage /buildroot/output/build/linux-6.18 /work/linux-src
 
 RUN mkdir -p ~/rootfs
 
+COPY tests/test.c /tmp/test.c
+RUN mkdir -p board/sfs/overlay/tests && \
+    riscv64-linux-gnu-gcc -gdwarf-5 -static -o board/sfs/overlay/tests/run_tests /tmp/test.c && \
+    chmod +x board/sfs/overlay/tests/run_tests
+
 COPY sfs/ /work/sfs/
 
 RUN cd /work/sfs && \
@@ -99,6 +93,8 @@ RUN apt update && apt install -y cpio gzip && rm -rf /var/lib/apt/lists/* && \
     cd /tmp/initramfs && \
     zcat /work/rootfs.cpio.gz | cpio -idm && \
     cp /work/sfs/sfs.ko . && \
+    mkdir -p tests && \
+    cp /work/board/sfs/overlay/tests/run_tests tests/run_tests && \
     find . | cpio -o -H newc | gzip -9 > /work/rootfs.cpio.gz && \
     cd /work && rm -rf /tmp/initramfs
 
