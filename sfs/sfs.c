@@ -10,7 +10,7 @@
 #include <linux/mpage.h>
 #include <linux/types.h>
 
-#include "sfsutils/sfs.h"
+#include "sfs.h"
 
 
 #define SFS_SECTOR_SIZE 512
@@ -45,15 +45,16 @@ static int sfs_unlink (struct inode *,struct dentry *);
 static struct dentry* sfs_mkdir (struct mnt_idmap *, struct inode *, struct dentry *, umode_t);
 static int sfs_rmdir (struct inode *,struct dentry *);
 
+static int sfs_init_fs_context(struct fs_context *fc);
+static int sfs_get_tree(struct fs_context *fc);
 
 /* file_system_type operations */
-static struct dentry* sfs_mount (struct file_system_type *fst, int, const char *dev_name, void *data);
+//static struct dentry* sfs_mount (struct file_system_type *fst, int, const char *dev_name, void *data);
 
 // void sfs_free_fs(struct fs_context *fc);
 
 /* callback to mount_bdev */
-static int sfs_fill_super(struct super_block *, void *, int);
-
+int sfs_fill_super(struct super_block *sb, struct fs_context *fc);
 
 /* file_operations callbacks */
 static int     sfs_fop_open   (struct inode *, struct file *);
@@ -69,9 +70,9 @@ static int  sfs_write_inode   (struct inode *, struct writeback_control *wbc);
 
 /* address_space_operation callbacks */
 static int sfs_read_folio  (struct file *, struct folio *);
-static int sfs_write_begin(struct file *file, struct address_space *mapping,
-                            loff_t pos, unsigned len,
-                            struct folio **foliop, void **fsdata);
+static int sfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
+                     loff_t pos, unsigned int len,
+                     struct folio **foliop, void **fsdata);
 static int sfs_write_pages (struct address_space *, struct writeback_control *);
 
 static int sfs_get_block   (struct inode *inode, sector_t iblock,
@@ -90,7 +91,13 @@ static struct super_operations sfs_super_operations = {
 	.write_inode = sfs_write_inode
 };
 
-static struct inode_operations sfs_inode_operations = {
+/* FILE operations */
+static struct inode_operations sfs_file_inode_operations = {
+	/* nothing needed yet */
+};
+
+/* directory operations*/
+static struct inode_operations sfs_dir_inode_operations = {
 	.lookup = sfs_lookup,
 	.create = sfs_create,
 	.mkdir  = sfs_mkdir,
@@ -122,19 +129,24 @@ static struct file_operations sfs_directory_operations = {
 	.iterate_shared = sfs_dop_iterate_shared
 };
 
+static const struct fs_context_operations sfs_context_ops = {
+	.get_tree = sfs_get_tree,
+};
+
 static struct file_system_type sfs_fs_type = {
 	.owner		 = THIS_MODULE,
 	.name		 = "sfs",
 	.kill_sb	 = kill_block_super,
 	.fs_flags	 = FS_REQUIRES_DEV,
-	.mount           = sfs_mount
+	.init_fs_context = sfs_init_fs_context,
 };
+
 MODULE_ALIAS_FS("sfs");
 
 
 /*** function definitions ***/
-static int sfs_fill_super(struct super_block *sb, void *ptr, int arg) {
-
+int sfs_fill_super(struct super_block *sb, struct fs_context *fc)
+{
 	sb->s_blocksize = sb_set_blocksize(sb, SFS_BLOCK_SIZE);
 	if (sb->s_blocksize == 0) {
 		printk("sfs_fill_super: sb_set_blocksize 0 return\n");
@@ -186,16 +198,14 @@ static int sfs_fill_super(struct super_block *sb, void *ptr, int arg) {
 }
 
 
-static struct dentry* sfs_mount
-	(struct file_system_type *fst, int, const char *dev_name, void *data) {
-
-	struct dentry *block_directory_entry = mount_bdev(fst, 0, dev_name, data, sfs_fill_super);
-
-	if (block_directory_entry == NULL)
-		sfs_error_printk("sfs_mount: block_directory_entry NULL");
-
-	return block_directory_entry;
-
+static int sfs_init_fs_context(struct fs_context *fc)
+{
+	fc->ops = &sfs_context_ops;
+	return 0;
+}
+static int sfs_get_tree(struct fs_context *fc)
+{
+	return get_tree_bdev(fc, sfs_fill_super);
 }
 
 
@@ -256,16 +266,24 @@ static struct inode* sfs_lookup_inode
 	}
 
 	if (node->i_state == I_NEW) {
-		node->i_ino = inode_number;
-		node->i_op = &sfs_inode_operations;
-		node->i_mapping->a_ops = &sfs_address_space_operations;
-		node->i_fop = &sfs_file_operations;
+		struct sfs_mount_config *config = (struct sfs_mount_config *) sb->s_fs_info;
+		__u64 max_dirs = le64_to_cpu(config->super.max_dirs);
 
-		// todo check if directory or not
-		
+		node->i_ino = inode_number;
+
+		if (inode_number < max_dirs) {
+			node->i_mode = S_IFDIR | 0755;
+			node->i_op = &sfs_dir_inode_operations;
+			node->i_fop = &sfs_directory_operations;
+		} else {
+			node->i_mode = S_IFREG | 0644;
+			node->i_op = &sfs_file_inode_operations;
+			node->i_fop = &sfs_file_operations;
+			node->i_mapping->a_ops = &sfs_address_space_operations;
+		}
 
 		/* unset the state */
-		node->i_state &= ~(I_NEW);
+		unlock_new_inode(node);
 	}
 
 	return node;
@@ -289,7 +307,6 @@ static struct inode* sfs_lookup_empty_inode
 	
 	if (node->i_state == I_NEW) {
 		node->i_ino = inode_number;
-		node->i_op = &sfs_inode_operations;
 		node->i_mapping->a_ops = &sfs_address_space_operations;
 		node->i_fop = &sfs_file_operations;
 
@@ -298,10 +315,14 @@ static struct inode* sfs_lookup_empty_inode
 		if (inode_number <= s->max_dirs) {
 			/* directory */
 			node->i_mode |= S_IFDIR;
+			node->i_op = &sfs_dir_inode_operations;
+
 
 		} else {
 			/* regular file */
 			node->i_mode |= S_IFREG;
+			node->i_op = &sfs_file_inode_operations;
+
 		}
 
 
@@ -328,7 +349,7 @@ static struct inode* sfs_lookup_sfs_inode(struct super_block *sb, unsigned int i
 	
 	if (node->i_state == I_NEW) {
 		node->i_ino = inode_number;
-		node->i_op = &sfs_inode_operations;
+		node->i_op = &sfs_file_inode_operations;
 		node->i_mapping->a_ops = &sfs_address_space_operations;
 		node->i_fop = &sfs_file_operations;
 
@@ -429,9 +450,9 @@ static int sfs_read_folio  (struct file *s, struct folio *fio) {
 	return ret;
 
 }
-static int sfs_write_begin(struct file *file, struct address_space *mapping,
-                           loff_t pos, unsigned len,
-                           struct folio **foliop, void **fsdata) {
+static int sfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
+                     loff_t pos, unsigned int len,
+                     struct folio **foliop, void **fsdata) {
 	int ret = block_write_begin(mapping, pos, len, foliop, sfs_get_block);
 	if (ret != 0)
 		sfs_error_printk("sfs_write_begin: block_write_begin error\n");
@@ -459,7 +480,7 @@ static int sfs_get_block (struct inode *inode, sector_t iblock,
 	if (create)
 		set_buffer_new (bh_result);
 
-	return sector_number + iblock;
+	return 0;
 }
 
 

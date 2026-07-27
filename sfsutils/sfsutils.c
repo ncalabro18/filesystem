@@ -10,7 +10,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include "sfs.h"
+#include "../sfs/sfs.h"
 
 
 static void *disk_image_mapping;

@@ -1,6 +1,7 @@
 
 MODULE_NAME = sfs
 SFS_IMG := $(shell pwd)/sfs.img
+KDIR ?= $(HOME)/linux
 
 
 obj-m += $(MODULE_NAME).o
@@ -18,11 +19,11 @@ build:
 	$(MAKE) $(MODULE_NAME).ko
 
 $(MODULE_NAME).ko: $(MODULE_NAME).c
-	$(MAKE) -C ~/linux modules M=$(shell pwd)
+	$(MAKE) -C $(KDIR) modules M=$(shell pwd)
 	cp $(MODULE_NAME).ko ~/rootfs
 	cp $(MODULE_NAME).mod ~/rootfs
-	cp sfsutils/sfsutils ~/rootfs
-	cp sfs.img ~/rootfs
+	# cp sfsutils/sfsutils ~/rootfs
+	# cp sfs.img ~/rootfs
 
 	cd ~/rootfs && find . | cpio -co > ../rootfs.cpio && cd ..
 

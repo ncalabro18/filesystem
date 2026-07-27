@@ -1,0 +1,2 @@
+*.sh text eol=lf
+board/sfs/overlay/init text eol=lf

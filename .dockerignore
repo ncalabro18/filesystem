@@ -1,0 +1,118 @@
+# .dockerignore - SFS RISC-V test image
+
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+.gitmodules
+
+# C build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.d
+
+# Kernel build
+linux/
+linux-*/
+vmlinux
+vmlinux.o
+System.map
+*.dtb
+*.dtbo
+include/config/
+include/generated/
+.config.old
+.kernelrelease
+.version
+*.tar
+*.tar.gz
+*.tar.xz
+
+# Object/debug/profiling artifacts
+*.gcno
+*.gcda
+*.gcov
+*.dSYM/
+*.su
+*.i
+*.s
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.cproject
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+Icon?
+
+# Logs, temp, and scratch files
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+tmp/
+temp/
+
+# Test artifacts
+*.img
+*.qcow2
+*.cpio
+*.cpio.gz
+rootfs*/
+rootfs-riscv64/
+
+# Docker/Podman meta files
+Dockerfile*
+Containerfile*
+docker-compose*.yml
+.dockerignore
+
+# Documentation / repo meta not needed inside the image
+README*
+LICENSE*
+CHANGELOG*
+docs/
+*.md
+
+# CI / editor config
+.editorconfig
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Python artifacts
+__pycache__/
+*.pyc
+node_modules/
+.venv/
+venv/

@@ -5,7 +5,6 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-#include "../sfsutils/sfs.h"
 
 
 const char *EMPTY_STRING = "";
