@@ -1,5 +1,7 @@
 /* This file was provided with instructions describing implementation details of a simple filesystem
 	from Introduction to Linux Development offered by UMass Lowell, designed by Red Hat */
+#define _DEFAULT_SOURCE
+
 #include <stdbool.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -7,17 +9,101 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 #include "../sfs/sfs.h"
 
 
 static void *disk_image_mapping;
 static size_t mapping_size;
-static size_t max_file_size;
-static unsigned long max_inodes;
-static unsigned long max_dirs;
+static unsigned long total_inodes;
+static __u64 total_blocks;
+static __u64 inode_table_block, inode_table_blocks;
+static __u64 data_bitmap_block, data_bitmap_blocks;
+static __u64 data_start_block, data_block_count;
+
+static struct sfs_inode *inode_table_ptr(void)
+{
+	return (struct sfs_inode *)((char *)disk_image_mapping + inode_table_block * SFS_BLOCK_SIZE);
+}
+
+static unsigned char *bitmap_ptr(void)
+{
+	return (unsigned char *)disk_image_mapping + data_bitmap_block * SFS_BLOCK_SIZE;
+}
+
+static bool bitmap_test(__u64 rel_block)
+{
+	return (bitmap_ptr()[rel_block / 8] >> (rel_block % 8)) & 1;
+}
+
+static void bitmap_set(__u64 rel_block, bool val)
+{
+	unsigned char *b = bitmap_ptr();
+	if (val)
+		b[rel_block / 8] |= (1 << (rel_block % 8));
+	else
+		b[rel_block / 8] &= ~(1 << (rel_block % 8));
+}
+
+static long bitmap_alloc(void)
+{
+	__u64 i;
+	for (i = 0; i < data_block_count; i++) {
+		if (!bitmap_test(i)) {
+			bitmap_set(i, true);
+			return (long)i;
+		}
+	}
+	return -1;
+}
+
+/* Returns the absolute block number holding file_block_idx of node's data,
+ * allocating direct/indirect blocks on demand if alloc is true. Mirrors
+ * sfs_get_block()'s logic in the kernel module. */
+static __u64 file_block_ptr(struct sfs_inode *node, __u64 file_block_idx, bool alloc)
+{
+	if (file_block_idx < SFS_DIRECT_BLOCKS) {
+		__u64 blk = __le64_to_cpu(node->direct[file_block_idx]);
+		if (!blk && alloc) {
+			long rel = bitmap_alloc();
+			if (rel < 0) { fputs("No space left on device\n", stderr); exit(1); }
+			blk = data_start_block + rel;
+			node->direct[file_block_idx] = __cpu_to_le64(blk);
+		}
+		return blk;
+	}
+
+	__u64 idx = file_block_idx - SFS_DIRECT_BLOCKS;
+	if (idx >= SFS_PTRS_PER_INDIRECT) {
+		fputs("File too large\n", stderr);
+		exit(1);
+	}
+
+	__u64 indirect = __le64_to_cpu(node->indirect);
+	if (!indirect) {
+		if (!alloc)
+			return 0;
+		long rel = bitmap_alloc();
+		if (rel < 0) { fputs("No space left on device\n", stderr); exit(1); }
+		indirect = data_start_block + rel;
+		node->indirect = __cpu_to_le64(indirect);
+		memset((char *)disk_image_mapping + indirect * SFS_BLOCK_SIZE, 0, SFS_BLOCK_SIZE);
+	}
+
+	__le64 *ptrs = (__le64 *)((char *)disk_image_mapping + indirect * SFS_BLOCK_SIZE);
+	__u64 blk = __le64_to_cpu(ptrs[idx]);
+	if (!blk && alloc) {
+		long rel = bitmap_alloc();
+		if (rel < 0) { fputs("No space left on device\n", stderr); exit(1); }
+		blk = data_start_block + rel;
+		ptrs[idx] = __cpu_to_le64(blk);
+	}
+	return blk;
+}
+
 
 static _Noreturn void usage(void)
 {
@@ -134,34 +220,31 @@ int main(int argc, char **argv)
 	}
 }
 
-_Static_assert(sizeof(__u64) == sizeof(unsigned long) && sizeof(__u64) == sizeof(off_t), "Userspace types are too small");
 static void verify_and_load_sb(void)
 {
 	struct sfs_super *sb = disk_image_mapping;
-	__u64 sb_max_dirs = __le64_to_cpu(sb->max_dirs);
-	__u64 sb_max_files = __le64_to_cpu(sb->max_files);
-	__u64 sb_entry_size = __le64_to_cpu(sb->entry_size);
-	__u64 sb_max_inodes, inodes_size, dir_space, total_size;
+
 	if (memcmp(sb->magic, "SIMPLEFS", sizeof(sb->magic))) {
 		fputs("Invalid FS magic in super block\n", stderr);
 		exit(1);
 	}
-	if (__builtin_add_overflow(sb_max_dirs, sb_max_files, &sb_max_inodes)) {
-		fputs("Invalid metadata in super block (overflow)\n", stderr);
+
+	total_blocks = __le64_to_cpu(sb->total_blocks);
+	total_inodes = (unsigned long)__le64_to_cpu(sb->total_inodes);
+	inode_table_block = __le64_to_cpu(sb->inode_table_block);
+	inode_table_blocks = __le64_to_cpu(sb->inode_table_blocks);
+	data_bitmap_block = __le64_to_cpu(sb->data_bitmap_block);
+	data_bitmap_blocks = __le64_to_cpu(sb->data_bitmap_blocks);
+	data_start_block = __le64_to_cpu(sb->data_start_block);
+
+	if (data_start_block > total_blocks) {
+		fputs("Invalid metadata in super block (bad layout)\n", stderr);
 		exit(1);
 	}
-	max_file_size = (size_t)sb_entry_size;
-	if (max_file_size <= 0) {
-		fputs("Invalid metadata in super block (underflow)\n", stderr);
-		exit(1);
-	}
-	max_inodes = (unsigned long)sb_max_inodes;
-	max_dirs = (unsigned long)sb_max_dirs;
-	if (__builtin_mul_overflow(sb_max_inodes, sizeof(struct sfs_inode), &inodes_size) ||
-	    __builtin_mul_overflow(sb_max_dirs, sb_entry_size, &dir_space) ||
-	    __builtin_mul_overflow(sb_max_inodes, sb_entry_size, &total_size) ||
-	    (__u64)mapping_size < total_size) {
-		fputs("Invalid metadata in super block (not enough space)\n", stderr);
+	data_block_count = total_blocks - data_start_block;
+
+	if ((__u64)mapping_size < total_blocks * SFS_BLOCK_SIZE) {
+		fputs("Image smaller than superblock claims\n", stderr);
 		exit(1);
 	}
 }
@@ -230,9 +313,9 @@ static bool buf_eq(const struct buf *buf1, const struct buf *buf2)
 static void walk_inode_table(bool (*cb)(unsigned long ino, const struct buf *path, void *cookie), void *cookie)
 {
 	static const char slash = '/';
-	struct sfs_inode *inode_tbl = disk_image_mapping;
+	struct sfs_inode *inode_tbl = inode_table_ptr();
 	bool done = false;
-	for (unsigned long i = 1; !done && i < max_inodes; ++i) {
+	for (unsigned long i = 1; !done && i < total_inodes; ++i) {
 		struct buf buf = {};
 		unsigned long parent;
 		if (!inode_tbl[i].name[0])
@@ -274,27 +357,66 @@ static __u64 strtou64(char *str)
 
 void init(char *storage, char *size, char *dirs, char *entries)
 {
-	__u64 sb_size, sb_dirs, sb_inodes;
+	(void)size; /* block size is now fixed at SFS_BLOCK_SIZE - no longer configurable */
+	(void)dirs; /* no longer meaningful - single inode pool, type is per-inode via mode */
+
 	struct sfs_super super = {
-		.magic = {'S', 'I', 'M', 'P', 'L', 'E', 'F', 'S',},
+		.magic = {'S', 'I', 'M', 'P', 'L', 'E', 'F', 'S'},
 	};
+
 	set_up_mapping(storage, true);
-	sb_size = size ? strtou64(size) : 4096;
-	if (sb_size % 512) {
-		fputs("Invalid block size, must be multiple of 512 bytes\n", stderr);
-	}
-	sb_inodes = entries ? strtou64(entries) : mapping_size / sb_size;
-	sb_dirs = dirs ? strtou64(dirs) : 1 + ((sb_inodes - 1) / (sb_size / sizeof(struct sfs_inode)));
-	if (sb_inodes < sb_dirs) {
-		fputs("Number of directories exceeds overall limit on file count\n", stderr);
+
+	__u64 total_blocks = mapping_size / SFS_BLOCK_SIZE;
+	if (total_blocks < 4) {
+		fputs("Image too small\n", stderr);
 		exit(1);
 	}
-	super.entry_size = __cpu_to_le64(sb_size);
-	super.max_dirs = __cpu_to_le64(sb_dirs);
-	super.max_files = __cpu_to_le64(sb_inodes - sb_dirs);
+
+	__u64 sb_inodes = entries ? strtou64(entries) : (total_blocks / 4);
+	if (sb_inodes < 1)
+		sb_inodes = 1;
+
+	__u64 inode_table_bytes = sb_inodes * sizeof(struct sfs_inode);
+	__u64 inode_table_blocks = (inode_table_bytes + SFS_BLOCK_SIZE - 1) / SFS_BLOCK_SIZE;
+	__u64 reserved = 1 /* superblock */ + inode_table_blocks;
+
+	/* bitmap size depends on data block count, which depends on bitmap
+	 * size - solve iteratively (converges in a couple of steps) */
+	__u64 data_bitmap_blocks = 1, data_start, data_blocks;
+	for (;;) {
+		data_start = reserved + data_bitmap_blocks;
+		if (data_start >= total_blocks) {
+			fputs("Image too small for requested inode count\n", stderr);
+			exit(1);
+		}
+		data_blocks = total_blocks - data_start;
+		__u64 needed = (data_blocks + 8 * SFS_BLOCK_SIZE - 1) / (8 * SFS_BLOCK_SIZE);
+		if (needed == 0)
+			needed = 1;
+		if (needed == data_bitmap_blocks)
+			break;
+		data_bitmap_blocks = needed;
+	}
+
+	super.total_blocks = __cpu_to_le64(total_blocks);
+	super.total_inodes = __cpu_to_le64(sb_inodes);
+	super.inode_table_block = __cpu_to_le64(1);
+	super.inode_table_blocks = __cpu_to_le64(inode_table_blocks);
+	super.data_bitmap_block = __cpu_to_le64(1 + inode_table_blocks);
+	super.data_bitmap_blocks = __cpu_to_le64(data_bitmap_blocks);
+	super.data_start_block = __cpu_to_le64(data_start);
+
 	memcpy(disk_image_mapping, &super, sizeof(super));
-	verify_and_load_sb();
-	memset(disk_image_mapping + sizeof(super), 0, sizeof(struct sfs_inode) * sb_inodes);
+
+	memset((char *)disk_image_mapping + SFS_BLOCK_SIZE, 0,
+	       (size_t)inode_table_blocks * SFS_BLOCK_SIZE);
+	memset((char *)disk_image_mapping + (size_t)(1 + inode_table_blocks) * SFS_BLOCK_SIZE, 0,
+	       (size_t)data_bitmap_blocks * SFS_BLOCK_SIZE);
+
+	struct sfs_inode *inode_table = (struct sfs_inode *)((char *)disk_image_mapping + SFS_BLOCK_SIZE);
+	inode_table[0].mode = __cpu_to_le32(S_IFDIR | 0755);
+	inode_table[0].num_links = __cpu_to_le32(2);
+	inode_table[0].file_size = __cpu_to_le64(0);
 }
 
 struct tree_entry {
@@ -310,7 +432,7 @@ static bool list_callback(unsigned long ino, const struct buf *path, void *cooki
 	char *name = malloc(len + 1), *ptr = name;
 	while (len--)
 		*ptr++ = len[(char *)path->ptr];
-	*ptr++ = '\0';
+	*ptr = '\0';
 	resize_buf(table, table->len += sizeof(struct tree_entry));
 	next = table->ptr + table->len;
 	next[-1] = (struct tree_entry){
@@ -371,14 +493,17 @@ static char *find_parent_for_new(char *path, unsigned long *ino)
 		exit(1);
 	}
 	slash = strrchr(path, '/');
-	/* child of root dir */
 	if (slash == NULL) {
 		*ino = 0;
 		return path;
 	}
-	*slash = '\0'; /* split on final slash */
+	*slash = '\0';
 	if (!lookup(path, ino)) {
 		fprintf(stderr, "Parent directory %s does not exist\n", path);
+		exit(1);
+	}
+	if (!S_ISDIR(__le32_to_cpu(inode_table_ptr()[*ino].mode))) {
+		fprintf(stderr, "Parent %s is not a directory\n", path);
 		exit(1);
 	}
 	return slash + 1;
@@ -386,24 +511,25 @@ static char *find_parent_for_new(char *path, unsigned long *ino)
 
 static void new_file_impl(char *path, bool dir)
 {
-	unsigned long ino, start = dir ? 1 : max_dirs, end = dir ? max_dirs : max_inodes;
-	struct sfs_inode *inode_table = disk_image_mapping;
-	char *basename = find_parent_for_new(path, &ino);
+	unsigned long parent_ino;
+	struct sfs_inode *inode_table = inode_table_ptr();
+	char *basename = find_parent_for_new(path, &parent_ino);
 	size_t len = strlen(basename);
+
 	if (len > sizeof(inode_table->name)) {
 		fprintf(stderr, "Filename %s is too long\n", basename);
 		exit(1);
 	}
-	if (ino >= max_dirs) {
-		fprintf(stderr, "Parent %s is not a directory\n", path);
-		exit(1);
-	}
-	for (unsigned long i = start; i < end; ++i) {
+
+	for (unsigned long i = 1; i < total_inodes; ++i) {
 		if (!inode_table[i].name[0]) {
 			memcpy(inode_table[i].name, basename, len);
 			memset(inode_table[i].name + len, 0, sizeof(inode_table->name) - len);
-			inode_table[i].parent_dir = __cpu_to_le64(ino);
+			inode_table[i].parent_dir = __cpu_to_le64(parent_ino);
 			inode_table[i].file_size = 0;
+			inode_table[i].mode = __cpu_to_le32((dir ? S_IFDIR : S_IFREG) | 0755);
+			memset(inode_table[i].direct, 0, sizeof(inode_table[i].direct));
+			inode_table[i].indirect = 0;
 			return;
 		}
 	}
@@ -427,10 +553,27 @@ void mkdir_(char *storage, char *path)
 
 static void remove_file_impl(unsigned long ino)
 {
-	struct sfs_inode *inode_table = disk_image_mapping;
-	unsigned long parent = __le64_to_cpu(inode_table[ino].parent_dir);
-	memset(&inode_table[ino], 0, sizeof(inode_table[ino]));
-	inode_table[parent].file_size = __cpu_to_le64(__le64_to_cpu(inode_table[parent].file_size) - 1);
+	struct sfs_inode *node = &inode_table_ptr()[ino];
+
+	if (S_ISREG(__le32_to_cpu(node->mode))) {
+		for (int i = 0; i < SFS_DIRECT_BLOCKS; i++) {
+			__u64 blk = __le64_to_cpu(node->direct[i]);
+			if (blk)
+				bitmap_set(blk - data_start_block, false);
+		}
+		__u64 indirect = __le64_to_cpu(node->indirect);
+		if (indirect) {
+			__le64 *ptrs = (__le64 *)((char *)disk_image_mapping + indirect * SFS_BLOCK_SIZE);
+			for (int p = 0; p < (int)SFS_PTRS_PER_INDIRECT; p++) {
+				__u64 blk = __le64_to_cpu(ptrs[p]);
+				if (blk)
+					bitmap_set(blk - data_start_block, false);
+			}
+			bitmap_set(indirect - data_start_block, false);
+		}
+	}
+
+	memset(node, 0, sizeof(*node));
 }
 
 void unlink_(char *storage, char *path)
@@ -442,7 +585,7 @@ void unlink_(char *storage, char *path)
 		fprintf(stderr, "No such file %s\n", path);
 		exit(1);
 	}
-	if (ino < max_dirs) {
+	if (S_ISDIR(__le32_to_cpu(inode_table_ptr()[ino].mode))) {
 		fprintf(stderr, "Path %s is a directory\n", path);
 		exit(1);
 	}
@@ -451,21 +594,20 @@ void unlink_(char *storage, char *path)
 
 void rmdir_(char *storage, char *path)
 {
-	struct sfs_inode *inode_table;
 	unsigned long ino;
 	set_up_mapping(storage, true);
 	verify_and_load_sb();
-	inode_table = disk_image_mapping;
+	struct sfs_inode *inode_table = inode_table_ptr();
 	if (!lookup(path, &ino)) {
 		fprintf(stderr, "No such file %s\n", path);
 		exit(1);
 	}
-	if (ino >= max_dirs) {
+	if (!S_ISDIR(__le32_to_cpu(inode_table[ino].mode))) {
 		fprintf(stderr, "Path %s is a file\n", path);
 		exit(1);
 	}
-	for (unsigned long i = 1; i < max_inodes; ++i) {
-		if (__cpu_to_le64(ino) == inode_table[i].parent_dir) {
+	for (unsigned long i = 1; i < total_inodes; ++i) {
+		if (inode_table[i].name[0] && __le64_to_cpu(inode_table[i].parent_dir) == ino) {
 			fprintf(stderr, "Directory %s still contains children\n", path);
 			exit(1);
 		}
@@ -475,41 +617,67 @@ void rmdir_(char *storage, char *path)
 
 void dump(char *storage, char *path)
 {
-	struct sfs_inode *inode_table;
 	unsigned long ino;
-	size_t size;
 	set_up_mapping(storage, false);
 	verify_and_load_sb();
-	inode_table = disk_image_mapping;
 	if (!lookup(path, &ino)) {
 		fprintf(stderr, "No such file %s\n", path);
 		exit(1);
 	}
-	if (ino < max_dirs) {
+	struct sfs_inode *node = &inode_table_ptr()[ino];
+	if (S_ISDIR(__le32_to_cpu(node->mode))) {
 		fprintf(stderr, "Path %s is a directory\n", path);
 		exit(1);
 	}
-	size = __le64_to_cpu(inode_table[ino].file_size);
-	fwrite(disk_image_mapping + ino * max_file_size, sizeof(char), size, stdout);
+
+	__u64 remaining = __le64_to_cpu(node->file_size);
+	__u64 blk_idx = 0;
+
+	while (remaining) {
+		__u64 blk = file_block_ptr(node, blk_idx, false);
+		size_t chunk = remaining < SFS_BLOCK_SIZE ? (size_t)remaining : SFS_BLOCK_SIZE;
+
+		if (blk) {
+			fwrite((char *)disk_image_mapping + blk * SFS_BLOCK_SIZE, 1, chunk, stdout);
+		} else {
+			char zero[SFS_BLOCK_SIZE] = {0};
+			fwrite(zero, 1, chunk, stdout);
+		}
+		remaining -= chunk;
+		blk_idx++;
+	}
 }
 
 void alter(char *storage, char *path)
 {
-	struct sfs_inode *inode_table;
 	unsigned long ino;
-	size_t size;
 	set_up_mapping(storage, true);
 	verify_and_load_sb();
-	inode_table = disk_image_mapping;
 	if (!lookup(path, &ino)) {
 		fprintf(stderr, "No such file %s\n", path);
 		exit(1);
 	}
-	if (ino < max_dirs) {
+	struct sfs_inode *node = &inode_table_ptr()[ino];
+	if (S_ISDIR(__le32_to_cpu(node->mode))) {
 		fprintf(stderr, "Path %s is a directory\n", path);
 		exit(1);
 	}
-	size = fread(disk_image_mapping + ino * max_file_size, sizeof(char), max_file_size, stdin);
-	inode_table[ino].file_size = __cpu_to_le64(size);
-}
 
+	__u64 total = 0;
+	__u64 blk_idx = 0;
+	char buf[SFS_BLOCK_SIZE];
+	size_t n;
+
+	while ((n = fread(buf, 1, sizeof(buf), stdin)) > 0) {
+		__u64 blk = file_block_ptr(node, blk_idx, true);
+		memcpy((char *)disk_image_mapping + blk * SFS_BLOCK_SIZE, buf, n);
+		if (n < sizeof(buf))
+			memset((char *)disk_image_mapping + blk * SFS_BLOCK_SIZE + n, 0, sizeof(buf) - n);
+		total += n;
+		blk_idx++;
+		if (n < sizeof(buf))
+			break;
+	}
+
+	node->file_size = __cpu_to_le64(total);
+}
