@@ -58,6 +58,9 @@ RUN apt update && apt install -y \
     cpio \
     && rm -rf /var/lib/apt/lists/*
 
+RUN groupadd appgroup && \
+    useradd -m -g appgroup appuser
+
 RUN mkdir -p /mnt/sfs
 
 WORKDIR /work
@@ -71,15 +74,31 @@ COPY --from=buildroot-stage /buildroot/output/build/linux-6.18 /work/linux-src
 
 RUN mkdir -p ~/rootfs
 
-COPY tests/test.c /tmp/test.c
-RUN mkdir -p board/sfs/overlay/tests && \
-    riscv64-linux-gnu-gcc -gdwarf-5 -static -o board/sfs/overlay/tests/run_tests /tmp/test.c && \
-    chmod +x board/sfs/overlay/tests/run_tests
+RUN echo "=== sysroot ===" && \
+    riscv64-linux-gnu-gcc -print-sysroot && \
+    echo "=== gcc ===" && \
+    riscv64-linux-gnu-gcc -v && \
+    echo "=== stat macros ===" && \
+    echo '#include <sys/stat.h>' | \
+    riscv64-linux-gnu-gcc -dM -E - | grep S_IF
 
+COPY tests/test.c /tmp/test.c
+COPY tests/data/executable_test.c /tmp/executable_test.c
+# sfs.h dep for test.c
 COPY sfs/ /work/sfs/
+RUN mkdir -p board/sfs/overlay/tests && \
+    riscv64-linux-gnu-gcc -gdwarf-5 -static \
+    -o board/sfs/overlay/tests/run_tests /tmp/test.c && \
+    chmod +x board/sfs/overlay/tests/run_tests && \
+    \
+    riscv64-linux-gnu-gcc -static -o board/sfs/overlay/tests/executable_test /tmp/executable_test.c && \
+    chmod +x board/sfs/overlay/tests/run_tests board/sfs/overlay/tests/executable_test
+
 
 RUN cd /work/sfs && \
 make build ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- KDIR=/work/linux-src
+
+
 
 COPY sfsutils/ /work/sfsutils/
 RUN cd /work/sfsutils && \
@@ -93,8 +112,9 @@ RUN apt update && apt install -y cpio gzip && rm -rf /var/lib/apt/lists/* && \
     cd /tmp/initramfs && \
     zcat /work/rootfs.cpio.gz | cpio -idm && \
     cp /work/sfs/sfs.ko . && \
-    mkdir -p tests && \
+    mkdir -p tests/data && \
     cp /work/board/sfs/overlay/tests/run_tests tests/run_tests && \
+    cp /work/board/sfs/overlay/tests/executable_test tests/executable_test && \
     find . | cpio -o -H newc | gzip -9 > /work/rootfs.cpio.gz && \
     cd /work && rm -rf /tmp/initramfs
 

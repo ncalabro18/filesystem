@@ -1,8 +1,8 @@
 
 
-.PHONY
+.DEFAULT = run
+.PHONY = run image
 
-.DEFAULT
 
 image:
 	docker build -t sfs-riscv-test .

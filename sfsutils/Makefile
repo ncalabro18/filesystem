@@ -2,7 +2,7 @@
 CROSS_COMPILE=riscv64-linux-gnu-
 CC=gcc
 SYS_ROOT=$(HOME)/sysroot
-CFLAGS=-gdwarf-5 -std=c2x -Wdeclaration-after-statement -Wall -Wextra -static -fPIC -march=rv64id -mabi=lp64d # --sysroot=$(SYS_ROOT)
+CFLAGS=-gdwarf-5 -std=c2x -Wall -Wextra -static -fPIC -march=rv64id -mabi=lp64d # --sysroot=$(SYS_ROOT)
 
 .PHONY: all clean build
 .DEFAULT: sfsutils

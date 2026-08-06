@@ -1,6 +1,6 @@
 
 .PHONY = run build
-
+.DEFAULT = run
 
 MODULE_NAME = sfs
 
