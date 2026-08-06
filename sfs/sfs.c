@@ -200,7 +200,6 @@ static struct file_operations sfs_file_operations = {
 static struct file_operations sfs_directory_operations = {
 	.read           = generic_read_dir,
 	.fsync          = noop_fsync,
-	.release        = simple_transaction_release,
 
 	/* iterates directory entries, dir_emit() is used for output */
 	.iterate_shared = sfs_dop_iterate_shared

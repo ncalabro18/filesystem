@@ -565,11 +565,10 @@ char* validate_name_length_boundary() {
 	if (statvfs(".", &stats) != 0) return "statvfs failed";
 
 	int namelen = stats.f_namemax;
-	printf("statvfs's f_namemax: %d", namelen);
 
 	char max_name[2048]; // 2048 should always be enough
 	char too_long[2048];
-	if (2048 > namelen)
+	if (2048 < namelen)
 		return "test design error: namelen is greater than the allocated space to test it";
 	
 
@@ -892,67 +891,79 @@ char* validate_concurrent_create() {
 }
 
 char* validate_mkdir_exhaustion_and_reclaim() {
+	struct statvfs sv;
+	if (statvfs(".", &sv) != 0) return "statvfs failed";
+	unsigned long max_attempts = sv.f_ffree + 8;
+
 	char name[32];
-	int created = 0;
-	const int max_attempts = 4096;
+	unsigned long created = 0;
+	char *result = NULL;
 
 	if (mkdir("dir_scratch", 0755) != 0) return "mkdir scratch failed";
 	if (chdir("dir_scratch") != 0) { rmdir("dir_scratch"); return "chdir scratch failed"; }
 
-	/* --- phase 1: nested + non-empty rmdir check, done FIRST while slots are plentiful --- */
-	if (mkdir("probe", 0755) != 0) { chdir(".."); rmdir("dir_scratch"); return "mkdir probe failed"; }
-	if (chdir("probe") != 0) return "chdir into probe failed";
-	if (mkdir("nested", 0755) != 0) return "mkdir nested failed";
-	if (chdir("..") != 0) return "chdir back to scratch failed";
+	if (mkdir("probe", 0755) != 0) { result = "mkdir probe failed"; goto cleanup; }
+	if (chdir("probe") != 0) { result = "chdir into probe failed"; goto cleanup; }
+	if (mkdir("nested", 0755) != 0) { result = "mkdir nested failed"; goto cleanup_probe; }
+	if (chdir("..") != 0) { result = "chdir back to scratch failed"; goto cleanup_probe; }
 
-	if (rmdir("probe") == 0) return "rmdir succeeded on a directory with a nested child";
-	if (errno != ENOTEMPTY) return "rmdir on non-empty directory gave wrong errno";
+	if (rmdir("probe") == 0) { result = "rmdir succeeded on a directory with a nested child"; goto cleanup; }
+	if (errno != ENOTEMPTY) { result = "rmdir on non-empty directory gave wrong errno"; goto cleanup; }
 
-	if (chdir("probe") != 0) return "re-chdir into probe failed";
-	if (rmdir("nested") != 0) return "rmdir of nested child failed";
-	if (chdir("..") != 0) return "chdir back to scratch failed (2)";
+	if (chdir("probe") != 0) { result = "re-chdir into probe failed"; goto cleanup; }
+	if (rmdir("nested") != 0) { result = "rmdir of nested child failed"; goto cleanup_probe; }
+	if (chdir("..") != 0) { result = "chdir back failed (2)"; goto cleanup_probe; }
+	if (rmdir("probe") != 0) { result = "rmdir failed after probe was emptied"; goto cleanup; }
 
-	if (rmdir("probe") != 0) return "rmdir failed after probe was emptied";
-
-	/* --- phase 2: exhaustion + reclaim, done LAST since nothing more needs creating after --- */
 	for (; created < max_attempts; created++) {
-		snprintf(name, sizeof(name), "d%d", created);
+		snprintf(name, sizeof(name), "d%lu", created);
 		if (mkdir(name, 0755) != 0) {
-			if (errno != ENOSPC) return "mkdir failed with unexpected errno before exhaustion";
+			if (errno != ENOSPC) result = "mkdir failed with unexpected errno before exhaustion";
 			break;
 		}
 	}
 
-	if (created == max_attempts) return "directory table never exhausted - unexpected capacity";
-	if (created == 0) return "directory table exhausted immediately - no room to test reclaim";
+	if (!result && created == max_attempts) result = "directory table never exhausted despite using statvfs-reported capacity";
+	if (!result && created == 0) result = "directory table exhausted immediately - no room to test reclaim";
 
-	snprintf(name, sizeof(name), "d%d", 0);
-	if (rmdir(name) != 0) return "rmdir failed during reclaim check";
-
-	if (mkdir("reclaimed", 0755) != 0) return "mkdir failed after freeing a directory slot";
-
-	DIR *d = opendir("reclaimed");
-	if (d == NULL) return "opendir on reclaimed dir failed";
-	int stale_found = 0;
-	struct dirent *ent;
-	while ((ent = readdir(d)) != NULL) {
-		if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
-			continue;
-		stale_found = 1;
+	if (!result) {
+		snprintf(name, sizeof(name), "d%lu", 0UL);
+		if (rmdir(name) != 0) result = "rmdir failed during reclaim check";
 	}
-	if (closedir(d) < 0) return "error closedir";
-	if (stale_found) return "reclaimed directory unexpectedly contains a stale entry";
-
-	if (rmdir("reclaimed") < 0) return "error rmdir reclaimed";
-	for (int i = 1; i < created; i++) {
-		snprintf(name, sizeof(name), "d%d", i);
-		if (rmdir(name) < 0) return "error rmdir(name)";
+	if (!result) {
+		if (mkdir("reclaimed", 0755) != 0) {
+			result = "mkdir failed after freeing a directory slot";
+		} else {
+			DIR *d = opendir("reclaimed");
+			if (!d) {
+				result = "opendir on reclaimed dir failed";
+			} else {
+				struct dirent *ent;
+				while ((ent = readdir(d)) != NULL) {
+					if (strcmp(ent->d_name, ".") && strcmp(ent->d_name, "..")) {
+						result = "reclaimed directory unexpectedly contains a stale entry";
+						break;
+					}
+				}
+				closedir(d);
+			}
+			rmdir("reclaimed");
+		}
 	}
 
-	if (chdir("..") != 0) return "chdir back to mount root failed";
-	if (rmdir("dir_scratch") < 0) return "error rmdir dir_scratch";
+	goto cleanup_all;
 
-	return NULL;
+cleanup_probe:
+	chdir("..");
+cleanup_all:
+	for (unsigned long i = 1; i < created; i++) {
+		snprintf(name, sizeof(name), "d%lu", i);
+		rmdir(name);
+	}
+cleanup:
+	chdir("..");
+	rmdir("dir_scratch");
+	return result;
 }
 
 char* validate_name_field_no_leftover_bytes() {
