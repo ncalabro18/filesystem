@@ -55,6 +55,8 @@ struct sfs_mount_config {
 /*** function declarations ***/
 
 /* helpers */
+static bool sfs_dir_nblocks_sane(struct super_block *sb, __u64 nblocks, unsigned int ino);
+
 static int sfs_resolve_block(struct super_block *sb, struct sfs_mount_config *config,
                               struct sfs_inode *disk_ino, __u64 blk_idx, bool create,
                               __u64 *out_phys, bool *out_dirty);
@@ -273,6 +275,7 @@ int sfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	sb->s_maxbytes = (loff_t)SFS_MAX_FILE_BLOCKS * SFS_BLOCK_SIZE;
 	sb->s_op = &sfs_super_operations;
+	sb->s_flags |= SB_NOATIME;
 
 	struct inode *root = sfs_lookup_inode(sb, 0);
 	if (IS_ERR(root)) {
@@ -330,8 +333,9 @@ static int sfs_write_inode
 		return -EIO;
 	}
 
-	disk_ino.file_size = cpu_to_le64(i_size_read(in));
-	disk_ino.mode = cpu_to_le32(in->i_mode & 07777);
+
+	if (!S_ISDIR(in->i_mode))
+		disk_ino.file_size = cpu_to_le64(i_size_read(in));	disk_ino.mode = cpu_to_le32(in->i_mode & 07777);
 	disk_ino.uid = cpu_to_le32(from_kuid(&init_user_ns, in->i_uid));
 	disk_ino.gid = cpu_to_le32(from_kgid(&init_user_ns, in->i_gid));
 	disk_ino.num_links = cpu_to_le32(in->i_nlink);
@@ -614,6 +618,8 @@ static int sfs_dop_iterate_shared (struct file *file, struct dir_context *ctx) {
 		return -EIO;
 	}
 	nblocks = DIV_ROUND_UP(le64_to_cpu(dir_disk.file_size), SFS_BLOCK_SIZE);
+	if (!sfs_dir_nblocks_sane(sb, nblocks, dir->i_ino))
+		return -EIO;
 	pos = ctx->pos - 2;
 
 	for (b = pos / SFS_DIRENTS_PER_BLOCK; b < nblocks; b++) {
@@ -644,12 +650,19 @@ static int sfs_dop_iterate_shared (struct file *file, struct dir_context *ctx) {
 
 			namelen = strnlen(ents[s].name, sizeof(ents[s].name));
 			type = S_ISDIR(le32_to_cpu(child.mode)) ? DT_DIR : DT_REG;
+
+			/* Set pos to THIS entry first, so a failed dir_emit (buffer
+			 * full) correctly leaves the cursor here to retry next call. */
 			ctx->pos = b * SFS_DIRENTS_PER_BLOCK + s + 2;
 
 			if (!dir_emit(ctx, ents[s].name, namelen, ino, type)) {
 				stop = true;
 				break;
 			}
+
+			/* Emit succeeded - advance past this entry so the next
+			 * call resumes at s+1, not at this same slot again. */
+			ctx->pos = b * SFS_DIRENTS_PER_BLOCK + s + 1 + 2;
 		}
 		brelse(bh);
 		if (stop)
@@ -968,230 +981,6 @@ static int sfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry 
 	return 0;
 }
 
-/* directory entry helpers */
-
-static int sfs_dir_find(struct super_block *sb, struct sfs_mount_config *config,
-                         struct sfs_inode *dir_disk, const char *name, size_t namelen,
-                         unsigned int *out_ino)
-{
-	__u64 nblocks = DIV_ROUND_UP(le64_to_cpu(dir_disk->file_size), SFS_BLOCK_SIZE);
-	__u64 b;
-
-	for (b = 0; b < nblocks; b++) {
-		__u64 phys; bool dirty;
-		struct buffer_head *bh;
-		struct sfs_dirent *ents;
-		unsigned int s;
-
-		if (sfs_resolve_block(sb, config, dir_disk, b, false, &phys, &dirty) || !phys)
-			continue;
-		bh = sb_bread(sb, phys);
-		if (!bh)
-			continue;
-		ents = (struct sfs_dirent *)bh->b_data;
-		for (s = 0; s < SFS_DIRENTS_PER_BLOCK; s++) {
-			size_t enl;
-			if (le64_to_cpu(ents[s].inode) == 0)
-				continue;
-			enl = strnlen(ents[s].name, sizeof(ents[s].name));
-			if (enl == namelen && memcmp(ents[s].name, name, namelen) == 0) {
-				*out_ino = (unsigned int)le64_to_cpu(ents[s].inode);
-				brelse(bh);
-				return 0;
-			}
-		}
-		brelse(bh);
-	}
-	return -ENOENT;
-}
-
-/* dir_disk may be mutated (file_size grows); caller must persist it after */
-static int sfs_dir_add(struct super_block *sb, struct sfs_mount_config *config,
-                        struct sfs_inode *dir_disk, const char *name, size_t namelen, unsigned int ino)
-{
-	__u64 nblocks = DIV_ROUND_UP(le64_to_cpu(dir_disk->file_size), SFS_BLOCK_SIZE);
-	__u64 b, phys; bool dirty;
-	struct buffer_head *bh;
-	struct sfs_dirent *ents;
-	unsigned int s;
-	int ret;
-
-	for (b = 0; b < nblocks; b++) {
-		if (sfs_resolve_block(sb, config, dir_disk, b, false, &phys, &dirty) || !phys)
-			continue;
-		bh = sb_bread(sb, phys);
-		if (!bh)
-			continue;
-		ents = (struct sfs_dirent *)bh->b_data;
-		for (s = 0; s < SFS_DIRENTS_PER_BLOCK; s++) {
-			if (le64_to_cpu(ents[s].inode) == 0) {
-				memset(ents[s].name, 0, sizeof(ents[s].name));
-				memcpy(ents[s].name, name, namelen);
-				ents[s].inode = cpu_to_le64(ino);
-				mark_buffer_dirty(bh);
-				brelse(bh);
-				return 0;
-			}
-		}
-		brelse(bh);
-	}
-
-	ret = sfs_resolve_block(sb, config, dir_disk, nblocks, true, &phys, &dirty);
-	if (ret)
-		return ret;
-	bh = sb_bread(sb, phys);
-	if (!bh)
-		return -EIO;
-	memset(bh->b_data, 0, SFS_BLOCK_SIZE);
-	ents = (struct sfs_dirent *)bh->b_data;
-	memcpy(ents[0].name, name, namelen);
-	ents[0].inode = cpu_to_le64(ino);
-	mark_buffer_dirty(bh);
-	brelse(bh);
-
-	dir_disk->file_size = cpu_to_le64((nblocks + 1) * SFS_BLOCK_SIZE);
-	return 0;
-}
-
-static int sfs_dir_remove(struct super_block *sb, struct sfs_mount_config *config,
-                           struct sfs_inode *dir_disk, const char *name, size_t namelen)
-{
-	__u64 nblocks = DIV_ROUND_UP(le64_to_cpu(dir_disk->file_size), SFS_BLOCK_SIZE);
-	__u64 b;
-
-	for (b = 0; b < nblocks; b++) {
-		__u64 phys; bool dirty;
-		struct buffer_head *bh;
-		struct sfs_dirent *ents;
-		unsigned int s;
-
-		if (sfs_resolve_block(sb, config, dir_disk, b, false, &phys, &dirty) || !phys)
-			continue;
-		bh = sb_bread(sb, phys);
-		if (!bh)
-			continue;
-		ents = (struct sfs_dirent *)bh->b_data;
-		for (s = 0; s < SFS_DIRENTS_PER_BLOCK; s++) {
-			size_t enl;
-			if (le64_to_cpu(ents[s].inode) == 0)
-				continue;
-			enl = strnlen(ents[s].name, sizeof(ents[s].name));
-			if (enl == namelen && memcmp(ents[s].name, name, namelen) == 0) {
-				memset(&ents[s], 0, sizeof(ents[s]));
-				mark_buffer_dirty(bh);
-				brelse(bh);
-				return 0;
-			}
-		}
-		brelse(bh);
-	}
-	return -ENOENT;
-}
-
-static bool sfs_dir_is_empty(struct super_block *sb, struct sfs_mount_config *config, struct sfs_inode *dir_disk)
-{
-	__u64 nblocks = DIV_ROUND_UP(le64_to_cpu(dir_disk->file_size), SFS_BLOCK_SIZE);
-	__u64 b;
-
-	for (b = 0; b < nblocks; b++) {
-		__u64 phys; bool dirty;
-		struct buffer_head *bh;
-		struct sfs_dirent *ents;
-		unsigned int s;
-
-		if (sfs_resolve_block(sb, config, dir_disk, b, false, &phys, &dirty) || !phys)
-			continue;
-		bh = sb_bread(sb, phys);
-		if (!bh)
-			continue;
-		ents = (struct sfs_dirent *)bh->b_data;
-		for (s = 0; s < SFS_DIRENTS_PER_BLOCK; s++) {
-			if (le64_to_cpu(ents[s].inode) != 0) {
-				brelse(bh);
-				return false;
-			}
-		}
-		brelse(bh);
-	}
-	return true;
-}
-
-static int sfs_create(struct mnt_idmap *idmap, struct inode *dir,
-                      struct dentry *d, umode_t mode, bool excl) {
-	struct sfs_mount_config *config = (struct sfs_mount_config*) dir->i_sb->s_fs_info;
-	struct sfs_inode dir_disk, disk_ino;
-	struct inode *new_node;
-	long slot;
-	unsigned int existing;
-	struct timespec64 now = current_time(dir);
-
-	if (config == NULL)
-		return -EINVAL;
-	if (d->d_name.len >= sizeof(((struct sfs_dirent *)0)->name))
-		return -ENAMETOOLONG;
-
-	down_write(&config->lock);
-
-	if (sfs_read_disk_inode(dir->i_sb, dir->i_ino, &dir_disk)) {
-		up_write(&config->lock);
-		return -EIO;
-	}
-	if (sfs_dir_find(dir->i_sb, config, &dir_disk, d->d_name.name, d->d_name.len, &existing) == 0) {
-		up_write(&config->lock);
-		return -EEXIST;
-	}
-
-	slot = sfs_alloc_inode_slot(config);
-	if (slot < 0) {
-		up_write(&config->lock);
-		return -ENOSPC;
-	}
-
-	memset(&disk_ino, 0, sizeof(disk_ino));
-	disk_ino.mode = cpu_to_le32(S_IFREG | (mode & 07777));
-	disk_ino.num_links = cpu_to_le32(1);
-	disk_ino.access_time = disk_ino.modified_time =
-		disk_ino.metadata_modified_time = disk_ino.birth_time = cpu_to_le64(now.tv_sec);
-
-	if (sfs_write_disk_inode(dir->i_sb, (unsigned int)slot, &disk_ino)) {
-		config->inode_free_stack[config->inode_free_count++] = (unsigned int)slot;
-		up_write(&config->lock);
-		return -EIO;
-	}
-
-	if (sfs_dir_add(dir->i_sb, config, &dir_disk, d->d_name.name, d->d_name.len, (unsigned int)slot)) {
-		memset(&disk_ino, 0, sizeof(disk_ino));
-		sfs_write_disk_inode(dir->i_sb, (unsigned int)slot, &disk_ino);
-		config->inode_free_stack[config->inode_free_count++] = (unsigned int)slot;
-		up_write(&config->lock);
-		return -ENOSPC;
-	}
-	if (sfs_write_disk_inode(dir->i_sb, dir->i_ino, &dir_disk)) {
-		up_write(&config->lock);
-		return -EIO;
-	}
-
-	new_node = sfs_lookup_inode(dir->i_sb, (unsigned int)slot);
-	if (IS_ERR(new_node)) {
-		up_write(&config->lock);
-		return PTR_ERR(new_node);
-	}
-
-	inode_init_owner(idmap, new_node, dir, mode);
-	new_node->i_mode = S_IFREG | (new_node->i_mode & 07777);
-
-	disk_ino.uid = cpu_to_le32(from_kuid(&init_user_ns, new_node->i_uid));
-	disk_ino.gid = cpu_to_le32(from_kgid(&init_user_ns, new_node->i_gid));
-	if (sfs_write_disk_inode(dir->i_sb, (unsigned int)slot, &disk_ino)) {
-		up_write(&config->lock);
-		return -EIO;
-	}
-
-	d_instantiate(d, new_node);
-	up_write(&config->lock);
-	return 0;
-}
-
 
 /* symlink operation callbacks */
 static int sfs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry *d, const char *target)
@@ -1313,6 +1102,245 @@ static int sfs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry
 	d_instantiate(d, new_node);
 	return 0;
 }
+
+
+/* directory entry helpers */
+
+static int sfs_dir_find(struct super_block *sb, struct sfs_mount_config *config,
+                         struct sfs_inode *dir_disk, const char *name, size_t namelen,
+                         unsigned int *out_ino)
+{
+	__u64 nblocks = DIV_ROUND_UP(le64_to_cpu(dir_disk->file_size), SFS_BLOCK_SIZE);
+	__u64 b;
+
+	for (b = 0; b < nblocks; b++) {
+		__u64 phys; bool dirty;
+		struct buffer_head *bh;
+		struct sfs_dirent *ents;
+		unsigned int s;
+
+		if (sfs_resolve_block(sb, config, dir_disk, b, false, &phys, &dirty) || !phys)
+			continue;
+		bh = sb_bread(sb, phys);
+		if (!bh)
+			continue;
+		ents = (struct sfs_dirent *)bh->b_data;
+		for (s = 0; s < SFS_DIRENTS_PER_BLOCK; s++) {
+			size_t enl;
+			if (le64_to_cpu(ents[s].inode) == 0)
+				continue;
+			enl = strnlen(ents[s].name, sizeof(ents[s].name));
+			if (enl == namelen && memcmp(ents[s].name, name, namelen) == 0) {
+				*out_ino = (unsigned int)le64_to_cpu(ents[s].inode);
+				brelse(bh);
+				return 0;
+			}
+		}
+		brelse(bh);
+	}
+	return -ENOENT;
+}
+
+/* dir_disk may be mutated (file_size grows); caller must persist it after */
+static int sfs_dir_add(struct super_block *sb, struct sfs_mount_config *config,
+                        struct sfs_inode *dir_disk, const char *name, size_t namelen, unsigned int ino)
+{
+
+	__u64 nblocks = DIV_ROUND_UP(le64_to_cpu(dir_disk->file_size), SFS_BLOCK_SIZE);
+	if (!sfs_dir_nblocks_sane(sb, nblocks, ino))
+		return -EIO;
+	__u64 b, phys; bool dirty;
+	struct buffer_head *bh;
+	struct sfs_dirent *ents;
+	unsigned int s;
+	int ret;
+
+	for (b = 0; b < nblocks; b++) {
+		if (sfs_resolve_block(sb, config, dir_disk, b, false, &phys, &dirty) || !phys)
+			continue;
+		bh = sb_bread(sb, phys);
+		if (!bh)
+			continue;
+		ents = (struct sfs_dirent *)bh->b_data;
+		for (s = 0; s < SFS_DIRENTS_PER_BLOCK; s++) {
+			if (le64_to_cpu(ents[s].inode) == 0) {
+				memset(ents[s].name, 0, sizeof(ents[s].name));
+				memcpy(ents[s].name, name, namelen);
+				ents[s].inode = cpu_to_le64(ino);
+				mark_buffer_dirty(bh);
+				brelse(bh);
+				return 0;
+			}
+		}
+		brelse(bh);
+		cond_resched();
+	}
+
+	ret = sfs_resolve_block(sb, config, dir_disk, nblocks, true, &phys, &dirty);
+	if (ret)
+		return ret;
+	bh = sb_bread(sb, phys);
+	if (!bh)
+		return -EIO;
+	memset(bh->b_data, 0, SFS_BLOCK_SIZE);
+	ents = (struct sfs_dirent *)bh->b_data;
+	memcpy(ents[0].name, name, namelen);
+	ents[0].inode = cpu_to_le64(ino);
+	mark_buffer_dirty(bh);
+	brelse(bh);
+
+	dir_disk->file_size = cpu_to_le64((nblocks + 1) * SFS_BLOCK_SIZE);
+	return 0;
+}
+
+static int sfs_dir_remove(struct super_block *sb, struct sfs_mount_config *config,
+                           struct sfs_inode *dir_disk, const char *name, size_t namelen)
+{
+	__u64 nblocks = DIV_ROUND_UP(le64_to_cpu(dir_disk->file_size), SFS_BLOCK_SIZE);
+	if (!sfs_dir_nblocks_sane(sb, nblocks, 0))
+		return -EIO;
+
+	__u64 b;
+	
+
+	for (b = 0; b < nblocks; b++) {
+		__u64 phys; bool dirty;
+		struct buffer_head *bh;
+		struct sfs_dirent *ents;
+		unsigned int s;
+
+		if (sfs_resolve_block(sb, config, dir_disk, b, false, &phys, &dirty) || !phys)
+			continue;
+		bh = sb_bread(sb, phys);
+		if (!bh)
+			continue;
+		ents = (struct sfs_dirent *)bh->b_data;
+		for (s = 0; s < SFS_DIRENTS_PER_BLOCK; s++) {
+			size_t enl;
+			if (le64_to_cpu(ents[s].inode) == 0)
+				continue;
+			enl = strnlen(ents[s].name, sizeof(ents[s].name));
+			if (enl == namelen && memcmp(ents[s].name, name, namelen) == 0) {
+				memset(&ents[s], 0, sizeof(ents[s]));
+				mark_buffer_dirty(bh);
+				brelse(bh);
+				return 0;
+			}
+		}
+		brelse(bh);
+		cond_resched();
+	}
+	return -ENOENT;
+}
+
+static bool sfs_dir_is_empty(struct super_block *sb, struct sfs_mount_config *config, struct sfs_inode *dir_disk)
+{
+	__u64 nblocks = DIV_ROUND_UP(le64_to_cpu(dir_disk->file_size), SFS_BLOCK_SIZE);
+	if (!sfs_dir_nblocks_sane(sb, nblocks, 0))
+		return false;
+	__u64 b;
+
+	for (b = 0; b < nblocks; b++) {
+		__u64 phys; bool dirty;
+		struct buffer_head *bh;
+		struct sfs_dirent *ents;
+		unsigned int s;
+
+		if (sfs_resolve_block(sb, config, dir_disk, b, false, &phys, &dirty) || !phys)
+			continue;
+		bh = sb_bread(sb, phys);
+		if (!bh)
+			continue;
+		ents = (struct sfs_dirent *)bh->b_data;
+		for (s = 0; s < SFS_DIRENTS_PER_BLOCK; s++) {
+			if (le64_to_cpu(ents[s].inode) != 0) {
+				brelse(bh);
+				return false;
+			}
+		}
+		brelse(bh);
+		cond_resched();
+	}
+	return true;
+}
+
+static int sfs_create(struct mnt_idmap *idmap, struct inode *dir,
+                      struct dentry *d, umode_t mode, bool excl) {
+	struct sfs_mount_config *config = (struct sfs_mount_config*) dir->i_sb->s_fs_info;
+	struct sfs_inode dir_disk, disk_ino;
+	struct inode *new_node;
+	long slot;
+	unsigned int existing;
+	struct timespec64 now = current_time(dir);
+
+	if (config == NULL)
+		return -EINVAL;
+	if (d->d_name.len >= sizeof(((struct sfs_dirent *)0)->name))
+		return -ENAMETOOLONG;
+
+	down_write(&config->lock);
+
+	if (sfs_read_disk_inode(dir->i_sb, dir->i_ino, &dir_disk)) {
+		up_write(&config->lock);
+		return -EIO;
+	}
+	if (sfs_dir_find(dir->i_sb, config, &dir_disk, d->d_name.name, d->d_name.len, &existing) == 0) {
+		up_write(&config->lock);
+		return -EEXIST;
+	}
+
+	slot = sfs_alloc_inode_slot(config);
+	if (slot < 0) {
+		up_write(&config->lock);
+		return -ENOSPC;
+	}
+
+	memset(&disk_ino, 0, sizeof(disk_ino));
+	disk_ino.mode = cpu_to_le32(S_IFREG | (mode & 07777));
+	disk_ino.num_links = cpu_to_le32(1);
+	disk_ino.access_time = disk_ino.modified_time =
+		disk_ino.metadata_modified_time = disk_ino.birth_time = cpu_to_le64(now.tv_sec);
+
+	if (sfs_write_disk_inode(dir->i_sb, (unsigned int)slot, &disk_ino)) {
+		config->inode_free_stack[config->inode_free_count++] = (unsigned int)slot;
+		up_write(&config->lock);
+		return -EIO;
+	}
+
+	if (sfs_dir_add(dir->i_sb, config, &dir_disk, d->d_name.name, d->d_name.len, (unsigned int)slot)) {
+		memset(&disk_ino, 0, sizeof(disk_ino));
+		sfs_write_disk_inode(dir->i_sb, (unsigned int)slot, &disk_ino);
+		config->inode_free_stack[config->inode_free_count++] = (unsigned int)slot;
+		up_write(&config->lock);
+		return -ENOSPC;
+	}
+	if (sfs_write_disk_inode(dir->i_sb, dir->i_ino, &dir_disk)) {
+		up_write(&config->lock);
+		return -EIO;
+	}
+
+	new_node = sfs_lookup_inode(dir->i_sb, (unsigned int)slot);
+	if (IS_ERR(new_node)) {
+		up_write(&config->lock);
+		return PTR_ERR(new_node);
+	}
+
+	inode_init_owner(idmap, new_node, dir, mode);
+	new_node->i_mode = S_IFREG | (new_node->i_mode & 07777);
+
+	disk_ino.uid = cpu_to_le32(from_kuid(&init_user_ns, new_node->i_uid));
+	disk_ino.gid = cpu_to_le32(from_kgid(&init_user_ns, new_node->i_gid));
+	if (sfs_write_disk_inode(dir->i_sb, (unsigned int)slot, &disk_ino)) {
+		up_write(&config->lock);
+		return -EIO;
+	}
+
+	d_instantiate(d, new_node);
+	up_write(&config->lock);
+	return 0;
+}
+
+
 
 static const char *sfs_get_link(struct dentry *dentry, struct inode *inode, struct delayed_call *done)
 {
@@ -1653,6 +1681,16 @@ static void sfs_free_data_block(struct sfs_mount_config *config, __u64 rel_block
 	clear_bit(rel_block, config->data_bitmap);
 }
 
+
+static bool sfs_dir_nblocks_sane(struct super_block *sb, __u64 nblocks, unsigned int ino)
+{
+	if (nblocks > SFS_MAX_FILE_BLOCKS) {
+		sfs_error_printk("CORRUPT: dir ino=%u has nblocks=%llu (max=%u) - refusing to scan\n",
+		                  ino, (unsigned long long)nblocks, (unsigned int)SFS_MAX_FILE_BLOCKS);
+		return false;
+	}
+	return true;
+}
 
 
 /*** Module callbacks and setup ***/
