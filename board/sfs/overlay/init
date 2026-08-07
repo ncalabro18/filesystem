@@ -1,19 +1,50 @@
 #!/bin/sh
 # /init - PID 1 for the SFS test/demo image.
-#
-# Buildroot's overlay mechanism copies this to the rootfs root as-is.
-#
-# Boot flow:
-#   - mount virtual filesystems
-#   - load the SFS module
-#   - mount the test image (second virtio-blk device, /dev/vdb)
-#   - run either the demo block or the test suite, depending on
-#   - what's present in /test
-#   - clean unmount + module removal
-#   - power off - no interactive shell, no hang, deterministic exit
 
-
+# make an unset env variable cause an error
 set -u
+
+WATCHDOG_PID=
+
+start_watchdog()
+{
+    test_pid="$1"
+
+    (
+        sleep "${SFS_TEST_TIMEOUT:-300}"
+
+        if kill -0 "$test_pid" 2>/dev/null; then
+            echo "[init] WATCHDOG: test timed out after ${SFS_TEST_TIMEOUT:-300}s"
+            echo "[init] WATCHDOG: dumping task states"
+            if ! echo t > /proc/sysrq-trigger; then
+                echo "[init] WATCHDOG: failed to dump task states"
+            fi
+
+            sleep 2
+
+            echo "[init] WATCHDOG: dumping blocked-task info"
+            if ! echo w > /proc/sysrq-trigger; then
+                echo "[init] WATCHDOG: failed to dump blocked tasks"
+            fi
+
+            echo "[init] WATCHDOG: terminating test"
+            kill -KILL "$test_pid"
+        fi
+    ) &
+
+    WATCHDOG_PID=$!
+}
+
+stop_watchdog()
+{
+    if [ -n "$WATCHDOG_PID" ]; then
+        kill "$WATCHDOG_PID" 2>/dev/null
+        wait "$WATCHDOG_PID" 2>/dev/null
+        WATCHDOG_PID=
+    fi
+}
+
+
 
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
@@ -35,19 +66,58 @@ if ! mount -t sfs /dev/vda /mnt/sfs; then
     poweroff -f
 fi
 
-# Test-suite call
+
+### Run test suite ###
 if [ -x tests/run_tests ]; then
     echo "[init] running test suite"
-    tests/run_tests /mnt/sfs
+    tests/run_tests /mnt/sfs &
+    TEST_PID=$!
+
+    if [ "${SFS_ENABLE_WATCHDOG:-0}" = "1" ]; then
+        echo "[init] watchdog enabled"
+        start_watchdog "$TEST_PID"
+    fi
+
+    wait "$TEST_PID"
     TEST_STATUS=$?
+
+    if [ -n "$WATCHDOG_PID" ]; then
+        stop_watchdog
+    fi
+
     echo "[init] test suite exit code: $TEST_STATUS"
 else
+
     echo "[init] no test suite present, running basic demo"
-    echo "hello from SFS" > /mnt/sfs/test.txt
-    cat /mnt/sfs/test.txt
-    ls -la /mnt/sfs
+    echo "hello from SFS" > /mnt/sfs/basic_test.txt
+    echo "hello from SFS" > /basic_test.txt
+    if cmp -s basic_test.txt /mnt/sfs/basic_test.txt; then
+        echo "basic write verified successfully"
+    else
+        echo "Files differ"
+    fi
     TEST_STATUS=0
 fi
+
+
+### Unmount -> mount integrity test ###
+echo "unmount test string" > /mnt/sfs/unmount_test.txt
+echo "unmount test string" > /unmount_test.txt
+
+umount /mnt/sfs
+
+if ! mount -t sfs /dev/vda /mnt/sfs; then
+    echo "[init] FATAL: failed to mount SFS test image"
+    rmmod sfs
+    poweroff -f
+fi
+
+if cmp -s /unmount_test.txt /mnt/sfs/unmount_test.txt; then
+    echo "write -> unmount -> mount -> verified successfully"
+else
+    echo "Files differ"
+fi
+
 
 echo "[init] unmounting and removing module"
 umount /mnt/sfs
