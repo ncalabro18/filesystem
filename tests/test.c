@@ -568,7 +568,7 @@ char* validate_name_length_boundary() {
 
 	char max_name[2048]; // 2048 should always be enough
 	char too_long[2048];
-	if (2048 < namelen)
+	if (2048 < namelen + 8)
 		return "test design error: namelen is greater than the allocated space to test it";
 	
 
