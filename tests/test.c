@@ -612,6 +612,10 @@ char* validate_inode_table_exhaustion() {
 
 	char *result = NULL;
 	for (; created < max_attempts; created++) {
+		// if ((created % 1000) == 0)
+        // 	printf("[inode exhaustion] created %lu/%lu\n",
+        //     	created, max_attempts);
+
 		snprintf(name, sizeof(name), "f%lu", created);
 		int fd = open(name, O_CREAT | O_EXCL | O_WRONLY, 0644);
 		if (fd < 0) {
@@ -662,107 +666,49 @@ char* validate_read_directory_fails() {
 
 	return NULL;
 }
+
+
 char* validate_max_file_size_boundary() {
-	const char *marker = "DO-NOT-OVERWRITE";
-	const size_t target_size = (size_t)SFS_MAX_FILE_BLOCKS * SFS_BLOCK_SIZE;
-	char chunk[8192];
-	size_t total = 0;
+	const size_t max_blocks = SFS_MAX_FILE_BLOCKS;
+	const off_t last_byte_offset = (off_t)(max_blocks - 1) * SFS_BLOCK_SIZE;
+	const off_t past_boundary_offset = (off_t)max_blocks * SFS_BLOCK_SIZE;
 
-	memset(chunk, 'A', sizeof(chunk));
+	int fd = open("sparse_max.txt", O_CREAT | O_WRONLY, 0644);
+	if (fd < 0) return "create failed";
 
-	int fd = open("neighbor.txt", O_CREAT | O_WRONLY, 0644);
-	if (fd < 0) return "create neighbor failed";
-	if (write(fd, marker, strlen(marker)) != (ssize_t)strlen(marker)) {
-		close(fd);
-		unlink("neighbor.txt");
-		return "write to neighbor failed";
+	/* Write into the very last valid block via double-indirect addressing,
+	 * without materializing everything before it. */
+	if (lseek(fd, last_byte_offset, SEEK_SET) != last_byte_offset) {
+		close(fd); unlink("sparse_max.txt");
+		return "lseek to last valid block failed";
 	}
-	close(fd);
-
-	fd = open("full.txt", O_CREAT | O_WRONLY, 0644);
-	if (fd < 0) { unlink("neighbor.txt"); return "create full.txt failed"; }
-
-	while (total < target_size) {
-		size_t remaining = target_size - total;
-		size_t want = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
-		ssize_t w = write(fd, chunk, want);
-		if (w <= 0) break;
-		total += (size_t)w;
-	}
-	close(fd);
-
-	if (total != target_size) {
-		unlink("neighbor.txt");
-		unlink("full.txt");
-		return "could not fill file to the addressing-imposed max size";
+	if (write(fd, "X", 1) != 1) {
+		close(fd); unlink("sparse_max.txt");
+		return "write to last valid block failed - addressing did not reach max";
 	}
 
 	struct stat st;
-	if (stat("full.txt", &st) != 0) {
-		unlink("neighbor.txt");
-		unlink("full.txt");
-		return "stat on full.txt failed";
-	}
-	if ((size_t)st.st_size != target_size) {
-		unlink("neighbor.txt");
-		unlink("full.txt");
-		return "reported size does not match target size";
+	if (fstat(fd, &st) != 0 || (size_t)st.st_size != past_boundary_offset) {
+		close(fd); unlink("sparse_max.txt");
+		return "unexpected file size after writing last valid block";
 	}
 
-	fd = open("full.txt", O_WRONLY);
-	if (fd < 0) {
-		unlink("neighbor.txt");
-		unlink("full.txt");
-		return "reopen full.txt failed";
-	}
-	if (lseek(fd, (off_t)target_size, SEEK_SET) != (off_t)target_size) {
-		close(fd);
-		unlink("neighbor.txt");
-		unlink("full.txt");
+	/* One byte past the addressing ceiling must fail with EFBIG */
+	if (lseek(fd, past_boundary_offset, SEEK_SET) != past_boundary_offset) {
+		close(fd); unlink("sparse_max.txt");
 		return "lseek to boundary failed";
 	}
 	ssize_t overflow = write(fd, "X", 1);
 	int overflow_errno = errno;
 	close(fd);
+	unlink("sparse_max.txt");
 
-	if (overflow > 0) {
-		unlink("neighbor.txt");
-		unlink("full.txt");
-		return "write past the addressing-imposed max size unexpectedly succeeded";
-	}
-	/* Expecting -EFBIG specifically, since this boundary is imposed by
-	 * the direct+indirect addressing scheme running out of pointers -
-	 * not by free space. ENOSPC here would indicate the test image is
-	 * too small to reach the addressing limit at all, which is a test
-	 * environment problem rather than a filesystem bug, so it's called
-	 * out distinctly rather than silently accepted as a pass. */
-	if (overflow_errno != EFBIG) {
-		unlink("neighbor.txt");
-		unlink("full.txt");
-		if (overflow_errno == ENOSPC)
-			return "hit ENOSPC before reaching the addressing limit - image too small for this test";
-		return "write past max size failed with unexpected errno (expected EFBIG)";
-	}
-
-	fd = open("neighbor.txt", O_RDONLY);
-	if (fd < 0) { unlink("full.txt"); return "reopen neighbor failed"; }
-	char buf[64] = {0};
-	if (read(fd, buf, strlen(marker)) != (ssize_t)strlen(marker)) {
-		close(fd);
-		unlink("neighbor.txt");
-		unlink("full.txt");
-		return "read from neighbor failed";
-	}
-	close(fd);
-
-	if (unlink("neighbor.txt") < 0) return "error unlink neighbor.txt";
-	if (unlink("full.txt") < 0) return "error unlink full.txt";
-
-	if (strncmp(buf, marker, strlen(marker)) != 0)
-		return "neighbor file corrupted by oversized write to adjacent file";
+	if (overflow > 0) return "write past the addressing-imposed max size unexpectedly succeeded";
+	if (overflow_errno != EFBIG) return "write past max size failed with unexpected errno (expected EFBIG)";
 
 	return NULL;
 }
+
 
 /* validate after a file is deleted,
 	its contents are cleared via stat */

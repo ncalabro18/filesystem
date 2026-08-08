@@ -55,6 +55,15 @@ struct sfs_mount_config {
 /*** function declarations ***/
 
 /* helpers */
+static int sfs_ensure_block(struct super_block *sb, struct sfs_mount_config *config,
+                             __le64 *ptr_field, bool create, __u64 *out_block, bool *out_dirty);
+static int sfs_resolve_in_table(struct super_block *sb, struct sfs_mount_config *config,
+                                 __u64 table_block, __u64 idx, bool create,
+                                 bool zero_new_block, __u64 *out_phys);
+static void sfs_free_indirect_table(struct super_block *sb, struct sfs_mount_config *config,
+                                     __u64 table_block, bool entries_are_tables);
+
+
 static bool sfs_dir_nblocks_sane(struct super_block *sb, __u64 nblocks, unsigned int ino);
 
 static int sfs_resolve_block(struct super_block *sb, struct sfs_mount_config *config,
@@ -462,12 +471,66 @@ static int sfs_truncate_blocks(struct inode *inode, loff_t new_size)
 		return -EIO;
 	}
 
-	for (i = SFS_DIRECT_BLOCKS - 1; i >= (int)new_blocks; i--) {
-		__u64 blk = le64_to_cpu(disk_ino.direct[i]);
-		if (blk) {
-			sfs_free_data_block(config, blk - data_start);
-			sfs_sync_bitmap_bit(sb, config, blk - data_start, false);
-			disk_ino.direct[i] = 0;
+	/* double-indirect range */
+	{
+		__u64 dbl = le64_to_cpu(disk_ino.double_indirect);
+		__u64 dbl_base = SFS_DIRECT_BLOCKS + SFS_PTRS_PER_INDIRECT;
+
+		if (dbl && new_blocks <= dbl_base) {
+			sfs_free_indirect_table(sb, config, dbl, true);
+			sfs_free_data_block(config, dbl - data_start);
+			sfs_sync_bitmap_bit(sb, config, dbl - data_start, false);
+			disk_ino.double_indirect = 0;
+		} else if (dbl && new_blocks < dbl_base + SFS_DOUBLE_PTRS_PER_INDIRECT) {
+			__u64 keep_idx = new_blocks - dbl_base;
+			__u64 keep_outer = keep_idx / SFS_PTRS_PER_INDIRECT;
+			__u64 keep_inner = keep_idx % SFS_PTRS_PER_INDIRECT;
+			struct buffer_head *obh = sb_bread(sb, dbl);
+
+			if (obh) {
+				__le64 *outer = (__le64 *)obh->b_data;
+				bool outer_changed = false;
+				__u64 o;
+
+				for (o = SFS_PTRS_PER_INDIRECT - 1; o > keep_outer; o--) {
+					__u64 inner_blk = le64_to_cpu(outer[o]);
+					if (inner_blk) {
+						sfs_free_indirect_table(sb, config, inner_blk, false);
+						sfs_free_data_block(config, inner_blk - data_start);
+						sfs_sync_bitmap_bit(sb, config, inner_blk - data_start, false);
+						outer[o] = 0;
+						outer_changed = true;
+					}
+					cond_resched();
+				}
+
+				{
+					__u64 inner_blk = le64_to_cpu(outer[keep_outer]);
+					if (inner_blk) {
+						struct buffer_head *ibh = sb_bread(sb, inner_blk);
+						if (ibh) {
+							__le64 *inner = (__le64 *)ibh->b_data;
+							bool inner_changed = false;
+							__u64 ii = SFS_PTRS_PER_INDIRECT;
+							while (ii-- > keep_inner) {
+								__u64 blk = le64_to_cpu(inner[ii]);
+								if (blk) {
+									sfs_free_data_block(config, blk - data_start);
+									sfs_sync_bitmap_bit(sb, config, blk - data_start, false);
+									inner[ii] = 0;
+									inner_changed = true;
+								}
+							}
+							if (inner_changed)
+								mark_buffer_dirty(ibh);
+							brelse(ibh);
+						}
+					}
+				}
+				if (outer_changed)
+					mark_buffer_dirty(obh);
+				brelse(obh);
+			}
 		}
 	}
 
@@ -491,7 +554,7 @@ static int sfs_truncate_blocks(struct inode *inode, loff_t new_size)
 			sfs_sync_bitmap_bit(sb, config, indirect - data_start, false);
 			disk_ino.indirect = 0;
 		}
-	} else if (indirect) {
+	} else if (indirect && new_blocks < SFS_DIRECT_BLOCKS + SFS_PTRS_PER_INDIRECT) {
 		struct buffer_head *ibh = sb_bread(sb, indirect);
 		if (ibh) {
 			__le64 *ptrs = (__le64 *)ibh->b_data;
@@ -510,6 +573,15 @@ static int sfs_truncate_blocks(struct inode *inode, loff_t new_size)
 			if (changed)
 				mark_buffer_dirty(ibh);
 			brelse(ibh);
+		}
+	}
+
+	for (i = SFS_DIRECT_BLOCKS - 1; i >= (int)new_blocks; i--) {
+		__u64 blk = le64_to_cpu(disk_ino.direct[i]);
+		if (blk) {
+			sfs_free_data_block(config, blk - data_start);
+			sfs_sync_bitmap_bit(sb, config, blk - data_start, false);
+			disk_ino.direct[i] = 0;
 		}
 	}
 
@@ -1468,16 +1540,102 @@ static int sfs_get_block (struct inode *inode, sector_t iblock,
 
 
 /*** helper definitions ***/
+/* Ensures *ptr_field names an allocated, zeroed block, allocating one if
+ * unset and create is true. Used for the top-level indirect and
+ * double_indirect fields, both of which always point at pointer tables. */
+static int sfs_ensure_block(struct super_block *sb, struct sfs_mount_config *config,
+                             __le64 *ptr_field, bool create, __u64 *out_block, bool *out_dirty)
+{
+	__u64 data_start = le64_to_cpu(config->super.data_start_block);
+	__u64 blk = le64_to_cpu(*ptr_field);
+
+	if (!blk) {
+		struct buffer_head *bh;
+		long rel;
+		if (!create) {
+			*out_block = 0;
+			return 0;
+		}
+		rel = sfs_alloc_data_block(config);
+		if (rel < 0)
+			return -ENOSPC;
+		blk = data_start + rel;
+		sfs_sync_bitmap_bit(sb, config, rel, true);
+		*ptr_field = cpu_to_le64(blk);
+		*out_dirty = true;
+
+		bh = sb_bread(sb, blk);
+		if (!bh)
+			return -EIO;
+		memset(bh->b_data, 0, sb->s_blocksize);
+		mark_buffer_dirty(bh);
+		brelse(bh);
+	}
+	*out_block = blk;
+	return 0;
+}
+
+/* Reads/writes a single pointer slot at index `idx` inside the pointer
+ * table stored in block `table_block`, allocating the pointed-to block
+ * on demand if create is true. If zero_new_block is true, the newly
+ * allocated block is itself zeroed - required when it will be used as
+ * another pointer table (the outer level of double-indirect), not
+ * needed for a leaf data block (the VFS write path handles that). */
+static int sfs_resolve_in_table(struct super_block *sb, struct sfs_mount_config *config,
+                                 __u64 table_block, __u64 idx, bool create,
+                                 bool zero_new_block, __u64 *out_phys)
+{
+	struct buffer_head *bh = sb_bread(sb, table_block);
+	__le64 *ptrs;
+	__u64 blk;
+
+	if (!bh)
+		return -EIO;
+	ptrs = (__le64 *)bh->b_data;
+	blk = le64_to_cpu(ptrs[idx]);
+
+	if (!blk) {
+		long rel;
+		if (!create) {
+			brelse(bh);
+			*out_phys = 0;
+			return 0;
+		}
+		rel = sfs_alloc_data_block(config);
+		if (rel < 0) {
+			brelse(bh);
+			return -ENOSPC;
+		}
+		blk = le64_to_cpu(config->super.data_start_block) + rel;
+		sfs_sync_bitmap_bit(sb, config, rel, true);
+		ptrs[idx] = cpu_to_le64(blk);
+		mark_buffer_dirty(bh);
+
+		if (zero_new_block) {
+			struct buffer_head *nbh = sb_bread(sb, blk);
+			if (!nbh) {
+				brelse(bh);
+				return -EIO;
+			}
+			memset(nbh->b_data, 0, sb->s_blocksize);
+			mark_buffer_dirty(nbh);
+			brelse(nbh);
+		}
+	}
+	brelse(bh);
+	*out_phys = blk;
+	return 0;
+}
 
 static int sfs_resolve_block(struct super_block *sb, struct sfs_mount_config *config,
                               struct sfs_inode *disk_ino, __u64 blk_idx, bool create,
                               __u64 *out_phys, bool *out_dirty)
 {
-	__u64 data_start = le64_to_cpu(config->super.data_start_block);
 	*out_dirty = false;
 	*out_phys = 0;
 
 	if (blk_idx < SFS_DIRECT_BLOCKS) {
+		__u64 data_start = le64_to_cpu(config->super.data_start_block);
 		__u64 blk = le64_to_cpu(disk_ino->direct[blk_idx]);
 		if (!blk) {
 			long rel;
@@ -1494,57 +1652,42 @@ static int sfs_resolve_block(struct super_block *sb, struct sfs_mount_config *co
 		*out_phys = blk;
 		return 0;
 	}
+	blk_idx -= SFS_DIRECT_BLOCKS;
 
-	__u64 idx = blk_idx - SFS_DIRECT_BLOCKS;
-	if (idx >= SFS_PTRS_PER_INDIRECT)
-		return -EFBIG;
-
-	__u64 indirect = le64_to_cpu(disk_ino->indirect);
-	if (!indirect) {
-		struct buffer_head *ibh;
-		long rel;
-		if (!create)
+	if (blk_idx < SFS_PTRS_PER_INDIRECT) {
+		__u64 table_block;
+		int ret = sfs_ensure_block(sb, config, &disk_ino->indirect, create, &table_block, out_dirty);
+		if (ret)
+			return ret;
+		if (!table_block)
 			return 0;
-		rel = sfs_alloc_data_block(config);
-		if (rel < 0)
-			return -ENOSPC;
-		indirect = data_start + rel;
-		sfs_sync_bitmap_bit(sb, config, rel, true);
-		disk_ino->indirect = cpu_to_le64(indirect);
-		*out_dirty = true;
+		return sfs_resolve_in_table(sb, config, table_block, blk_idx, create, false, out_phys);
+	}
+	blk_idx -= SFS_PTRS_PER_INDIRECT;
 
-		ibh = sb_bread(sb, indirect);
-		if (!ibh)
-			return -EIO;
-		memset(ibh->b_data, 0, sb->s_blocksize);
-		mark_buffer_dirty(ibh);
-		brelse(ibh);
+	if (blk_idx < SFS_DOUBLE_PTRS_PER_INDIRECT) {
+		__u64 outer_idx = blk_idx / SFS_PTRS_PER_INDIRECT;
+		__u64 inner_idx = blk_idx % SFS_PTRS_PER_INDIRECT;
+		__u64 dbl_table_block, inner_table_block;
+		int ret;
+
+		ret = sfs_ensure_block(sb, config, &disk_ino->double_indirect, create, &dbl_table_block, out_dirty);
+		if (ret)
+			return ret;
+		if (!dbl_table_block)
+			return 0;
+
+		/* zero_new_block=true: this slot's value is itself a table */
+		ret = sfs_resolve_in_table(sb, config, dbl_table_block, outer_idx, create, true, &inner_table_block);
+		if (ret)
+			return ret;
+		if (!inner_table_block)
+			return 0;
+
+		return sfs_resolve_in_table(sb, config, inner_table_block, inner_idx, create, false, out_phys);
 	}
 
-	struct buffer_head *ibh = sb_bread(sb, indirect);
-	if (!ibh)
-		return -EIO;
-	__le64 *ptrs = (__le64 *)ibh->b_data;
-	__u64 blk = le64_to_cpu(ptrs[idx]);
-	if (!blk) {
-		long rel;
-		if (!create) {
-			brelse(ibh);
-			return 0;
-		}
-		rel = sfs_alloc_data_block(config);
-		if (rel < 0) {
-			brelse(ibh);
-			return -ENOSPC;
-		}
-		blk = data_start + rel;
-		sfs_sync_bitmap_bit(sb, config, rel, true);
-		ptrs[idx] = cpu_to_le64(blk);
-		mark_buffer_dirty(ibh);
-	}
-	brelse(ibh);
-	*out_phys = blk;
-	return 0;
+	return -EFBIG;
 }
 
 struct sfs_super* sfs_get_super(struct super_block *sb) {
@@ -1570,23 +1713,49 @@ static void sfs_free_inode_blocks(struct super_block *sb, struct sfs_mount_confi
 
 	__u64 indirect = le64_to_cpu(disk_ino->indirect);
 	if (indirect) {
-		struct buffer_head *ibh = sb_bread(sb, indirect);
-		if (ibh) {
-			__le64 *ptrs = (__le64 *)ibh->b_data;
-			int p;
-			for (p = 0; p < SFS_PTRS_PER_INDIRECT; p++) {
-				__u64 blk = le64_to_cpu(ptrs[p]);
-				if (blk) {
-					sfs_free_data_block(config, blk - data_start);
-					sfs_sync_bitmap_bit(sb, config, blk - data_start, false);
-				}
-			}
-			brelse(ibh);
-		}
+		sfs_free_indirect_table(sb, config, indirect, false);
 		sfs_free_data_block(config, indirect - data_start);
 		sfs_sync_bitmap_bit(sb, config, indirect - data_start, false);
 	}
+
+	__u64 dbl = le64_to_cpu(disk_ino->double_indirect);
+	if (dbl) {
+		sfs_free_indirect_table(sb, config, dbl, true);
+		sfs_free_data_block(config, dbl - data_start);
+		sfs_sync_bitmap_bit(sb, config, dbl - data_start, false);
+	}
 }
+
+/* Frees every non-zero pointer in the table stored at table_block. If
+ * entries_are_tables is true, each entry is itself a table whose own
+ * (leaf) entries are freed first - used for the outer level of
+ * double-indirect addressing. */
+static void sfs_free_indirect_table(struct super_block *sb, struct sfs_mount_config *config,
+                                     __u64 table_block, bool entries_are_tables)
+{
+	__u64 data_start = le64_to_cpu(config->super.data_start_block);
+	struct buffer_head *bh = sb_bread(sb, table_block);
+	unsigned int p;
+	__le64 *ptrs;
+
+	if (!bh)
+		return;
+	ptrs = (__le64 *)bh->b_data;
+
+	for (p = 0; p < SFS_PTRS_PER_INDIRECT; p++) {
+		__u64 blk = le64_to_cpu(ptrs[p]);
+		if (!blk)
+			continue;
+		if (entries_are_tables)
+			sfs_free_indirect_table(sb, config, blk, false);
+		sfs_free_data_block(config, blk - data_start);
+		sfs_sync_bitmap_bit(sb, config, blk - data_start, false);
+		if ((p & 0x3f) == 0)
+			cond_resched();
+	}
+	brelse(bh);
+}
+
 
 static int sfs_build_free_lists(struct super_block *sb, struct sfs_mount_config *config)
 {

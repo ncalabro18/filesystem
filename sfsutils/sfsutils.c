@@ -87,11 +87,7 @@ static long bitmap_alloc(void)
 	return -1;
 }
 
-/* Returns the absolute block number holding block_idx of node's data,
- * allocating direct/indirect blocks on demand if alloc is true. Applies
- * equally to regular files, symlinks, and directories - all three use
- * the same direct+indirect addressing, mirroring sfs_resolve_block() in
- * the kernel module. */
+/* Returns the absolute block number holding block_idx of node's data */
 static __u64 node_block_ptr(struct sfs_inode *node, __u64 block_idx, bool alloc)
 {
 	if (block_idx < SFS_DIRECT_BLOCKS) {
@@ -104,33 +100,66 @@ static __u64 node_block_ptr(struct sfs_inode *node, __u64 block_idx, bool alloc)
 		}
 		return blk;
 	}
+	block_idx -= SFS_DIRECT_BLOCKS;
 
-	__u64 idx = block_idx - SFS_DIRECT_BLOCKS;
-	if (idx >= SFS_PTRS_PER_INDIRECT) {
-		fputs("File too large\n", stderr);
-		exit(1);
+	if (block_idx < SFS_PTRS_PER_INDIRECT) {
+		__u64 indirect = __le64_to_cpu(node->indirect);
+		if (!indirect) {
+			if (!alloc) return 0;
+			long rel = bitmap_alloc();
+			if (rel < 0) { fputs("No space left on device\n", stderr); exit(1); }
+			indirect = data_start_block + rel;
+			node->indirect = __cpu_to_le64(indirect);
+			memset((char *)disk_image_mapping + indirect * SFS_BLOCK_SIZE, 0, SFS_BLOCK_SIZE);
+		}
+		__le64 *ptrs = (__le64 *)((char *)disk_image_mapping + indirect * SFS_BLOCK_SIZE);
+		__u64 blk = __le64_to_cpu(ptrs[block_idx]);
+		if (!blk && alloc) {
+			long rel = bitmap_alloc();
+			if (rel < 0) { fputs("No space left on device\n", stderr); exit(1); }
+			blk = data_start_block + rel;
+			ptrs[block_idx] = __cpu_to_le64(blk);
+		}
+		return blk;
+	}
+	block_idx -= SFS_PTRS_PER_INDIRECT;
+
+	if (block_idx < SFS_DOUBLE_PTRS_PER_INDIRECT) {
+		__u64 outer_idx = block_idx / SFS_PTRS_PER_INDIRECT;
+		__u64 inner_idx = block_idx % SFS_PTRS_PER_INDIRECT;
+
+		__u64 dbl = __le64_to_cpu(node->double_indirect);
+		if (!dbl) {
+			if (!alloc) return 0;
+			long rel = bitmap_alloc();
+			if (rel < 0) { fputs("No space left on device\n", stderr); exit(1); }
+			dbl = data_start_block + rel;
+			node->double_indirect = __cpu_to_le64(dbl);
+			memset((char *)disk_image_mapping + dbl * SFS_BLOCK_SIZE, 0, SFS_BLOCK_SIZE);
+		}
+		__le64 *outer = (__le64 *)((char *)disk_image_mapping + dbl * SFS_BLOCK_SIZE);
+		__u64 inner_table = __le64_to_cpu(outer[outer_idx]);
+		if (!inner_table) {
+			if (!alloc) return 0;
+			long rel = bitmap_alloc();
+			if (rel < 0) { fputs("No space left on device\n", stderr); exit(1); }
+			inner_table = data_start_block + rel;
+			outer[outer_idx] = __cpu_to_le64(inner_table);
+			memset((char *)disk_image_mapping + inner_table * SFS_BLOCK_SIZE, 0, SFS_BLOCK_SIZE);
+		}
+		__le64 *inner = (__le64 *)((char *)disk_image_mapping + inner_table * SFS_BLOCK_SIZE);
+		__u64 blk = __le64_to_cpu(inner[inner_idx]);
+		if (!blk && alloc) {
+			long rel = bitmap_alloc();
+			if (rel < 0) { fputs("No space left on device\n", stderr); exit(1); }
+			blk = data_start_block + rel;
+			inner[inner_idx] = __cpu_to_le64(blk);
+		}
+		return blk;
 	}
 
-	__u64 indirect = __le64_to_cpu(node->indirect);
-	if (!indirect) {
-		if (!alloc)
-			return 0;
-		long rel = bitmap_alloc();
-		if (rel < 0) { fputs("No space left on device\n", stderr); exit(1); }
-		indirect = data_start_block + rel;
-		node->indirect = __cpu_to_le64(indirect);
-		memset((char *)disk_image_mapping + indirect * SFS_BLOCK_SIZE, 0, SFS_BLOCK_SIZE);
-	}
-
-	__le64 *ptrs = (__le64 *)((char *)disk_image_mapping + indirect * SFS_BLOCK_SIZE);
-	__u64 blk = __le64_to_cpu(ptrs[idx]);
-	if (!blk && alloc) {
-		long rel = bitmap_alloc();
-		if (rel < 0) { fputs("No space left on device\n", stderr); exit(1); }
-		blk = data_start_block + rel;
-		ptrs[idx] = __cpu_to_le64(blk);
-	}
-	return blk;
+	fputs("File too large\n", stderr);
+	exit(1);
 }
 
 static void free_inode_blocks(struct sfs_inode *node)

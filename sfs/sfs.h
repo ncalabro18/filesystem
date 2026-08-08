@@ -8,7 +8,9 @@
 #define SFS_BLOCK_SIZE 4096
 #define SFS_DIRECT_BLOCKS 8
 #define SFS_PTRS_PER_INDIRECT (SFS_BLOCK_SIZE / sizeof(__le64))
-#define SFS_MAX_FILE_BLOCKS (SFS_DIRECT_BLOCKS + SFS_PTRS_PER_INDIRECT)
+#define SFS_DOUBLE_PTRS_PER_INDIRECT (SFS_PTRS_PER_INDIRECT * SFS_PTRS_PER_INDIRECT)
+#define SFS_MAX_FILE_BLOCKS (SFS_DIRECT_BLOCKS + SFS_PTRS_PER_INDIRECT + SFS_DOUBLE_PTRS_PER_INDIRECT)
+
 
 struct sfs_super {
 	char magic[8];              /* SIMPLEFS */
@@ -35,7 +37,8 @@ struct sfs_inode {
 	__le32 num_links;
 	__le64 direct[SFS_DIRECT_BLOCKS];
 	__le64 indirect;            /* block number of an indirect block, or 0 */
-	
+	__le64 double_indirect;
+
 	__le64 access_time;
 	__le64 modified_time;
 	__le64 metadata_modified_time;
