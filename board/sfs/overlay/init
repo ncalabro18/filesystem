@@ -6,6 +6,8 @@ set -u
 
 WATCHDOG_PID=
 
+# SFS_ENABLE_WATCHDOG=1 SFS_TEST_TIMEOUT=600
+
 start_watchdog()
 {
     test_pid="$1"
