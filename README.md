@@ -46,8 +46,8 @@ docker run --rm sfs-riscv-test
 
 No flags are needed. `run-qemu.sh` is the image's default `CMD`. It creates a
 fresh test disk image, boots the kernel, and `/init` loads the module,
-mounts the test image, runs the tests, unmounts the filesystem cleanly, and
-powers off. The entire run is deterministic.
+mounts the test image, runs the tests, unmounts, remounts for a persistence test,
+unmounts, then powers off. The entire run is deterministic.
 
 Optionally, pipe the output to a log file:
 
