@@ -7,7 +7,7 @@ IMG_SIZE_MB=${SFS_TEST_IMG_SIZE_MB:-128}
 if [ ! -f "$IMG" ]; then
     echo "[run-qemu] creating fresh ${IMG_SIZE_MB}MB test image at $IMG"
     qemu-img create -f raw "$IMG" "${IMG_SIZE_MB}M"
-    qemu-riscv64-static /work/sfsutils/sfsutils init "$IMG" 65536  
+    qemu-riscv64-static /work/sfsutils/sfsutils init "$IMG" 16384  
 fi
 
 qemu-system-riscv64 \
