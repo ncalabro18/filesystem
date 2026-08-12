@@ -22,7 +22,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#include "../sfs/sfs.h"
+#include "../sfs/sfs_module.h"
 
 #define SFS_DIRENTS_PER_BLOCK (SFS_BLOCK_SIZE / sizeof(struct sfs_dirent))
 #define SFS_NAME_MAX (sizeof(((struct sfs_dirent *)0)->name))
@@ -473,6 +473,16 @@ static __u64 strtou64_checked(const char *str)
 
 static void cmd_init(const char *storage, const char *entries)
 {
+
+	/* allocate and zero root's directory index block */
+	{
+		long rel = bitmap_alloc();
+		if (rel < 0) { fputs("Image too small for root index\n", stderr); exit(1); }
+		__u64 idx_blk = data_start_block + rel;
+		memset((char *)disk_image_mapping + idx_blk * SFS_BLOCK_SIZE, 0, SFS_BLOCK_SIZE);
+		root->index_block = __cpu_to_le64(idx_blk);
+	}
+	
 	struct sfs_super super = {
 		.magic = {'S', 'I', 'M', 'P', 'L', 'E', 'F', 'S'},
 	};
