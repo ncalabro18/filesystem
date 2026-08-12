@@ -1,9 +1,9 @@
-- name: Build
-  uses: docker/build-push-action@v6
-  with:
-    context: .
-    file: Dockerfile
-    tags: sfs-riscv-test:ci
-    load: true
-    cache-from: type=gha
-    cache-to: type=gha,mode=max
+name: Build Test Image
+uses: docker/build-push-action@v6
+with:
+  context: .
+  file: Dockerfile
+  tags: sfs-riscv-test:ci
+  load: true
+  cache-from: type=gha
+  cache-to: type=gha,mode=max
