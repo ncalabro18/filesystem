@@ -1,0 +1,3 @@
+- name: Run SFS Integration Tests
+  run: |
+    docker run --rm sfs-riscv-test:ci
