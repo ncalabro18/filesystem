@@ -12,6 +12,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build Test Image
         uses: docker/build-push-action@v6
         with:
@@ -19,8 +22,8 @@ jobs:
           file: Dockerfile
           tags: sfs-riscv-test:ci
           load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=inline
+          cache-to: type=inline,mode=max
 
       - name: Run Tests
         run: docker run --rm --privileged sfs-riscv-test:ci
