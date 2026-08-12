@@ -1,7 +1,7 @@
 
 # Simple Filesystem - SFS
 
-[![SFS Tests](https://github.com/ncalabro/filesystem/actions/workflows/test.yml/badge.svg)](https://github.com/ncalabro/filesystem/actions/workflows/test.yml)
+[![SFS Tests](https://github.com/ncalabro18/filesystem/actions/workflows/test.yml/badge.svg)](https://github.com/ncalabro18/filesystem/actions/workflows/test.yml)
 
 A filesystem targeting RISC-V.
 
