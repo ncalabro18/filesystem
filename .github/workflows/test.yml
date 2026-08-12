@@ -1,3 +1,26 @@
-name: Run Tests
-run: |
-  docker run --rm sfs-riscv-test:ci
+name: SFS Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Test Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          tags: sfs-riscv-test:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Tests
+        run: docker run --rm --privileged sfs-riscv-test:ci
