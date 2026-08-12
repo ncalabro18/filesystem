@@ -4,7 +4,9 @@ SFS_IMG := $(shell pwd)/sfs.img
 KDIR ?= $(HOME)/linux
 
 
-obj-m += $(MODULE_NAME).o
+obj-m += sfs.o
+sfs-y := sfs_module.o sfs_extent.o sfs_dir_index.o
+
 
 export CROSS_COMPILE=riscv64-linux-gnu-
 export ARCH=riscv
@@ -18,10 +20,9 @@ image:
 build:
 	$(MAKE) $(MODULE_NAME).ko
 
-$(MODULE_NAME).ko: $(MODULE_NAME).c
+$(MODULE_NAME).ko: $(sfs-deps)
 	$(MAKE) -C $(KDIR) modules M=$(shell pwd)
 	cp $(MODULE_NAME).ko ~/rootfs
-	cp $(MODULE_NAME).mod ~/rootfs
 	# cp sfsutils/sfsutils ~/rootfs
 	# cp sfs.img ~/rootfs
 

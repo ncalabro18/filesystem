@@ -14,15 +14,19 @@
 #include <linux/statfs.h>
 #include <linux/bitmap.h>
 
+#include "sfs_internal.h"
+#include "sfs_extent.h"
+#include "sfs_dir_index.h"
 
-#include "sfs.h"
+#include "sfs_module.h"
 
-
+#define SFS_DIR_POS_BUCKET_SHIFT 40
+#define SFS_DIR_POS_CHAIN_SHIFT 20
+#define SFS_DIR_POS_MASK ((1ULL << SFS_DIR_POS_CHAIN_SHIFT) - 1)
 
 #define SFS_SECTOR_SIZE 512
 #define SFS_BLOCK_SIZE 4096
 
-#define SFS_DIRENTS_PER_BLOCK (SFS_BLOCK_SIZE / sizeof(struct sfs_dirent))
 
 
 #define SFS_DEBUG 1
@@ -41,52 +45,15 @@ struct sfs_child_list {
 	unsigned int capacity;
 };
 
-struct sfs_mount_config {
-	struct rw_semaphore lock;
-	struct sfs_super super;
-	unsigned int *inode_free_stack;
-	unsigned int inode_free_count;
-	unsigned long *data_bitmap;
-	__u64 data_block_count;
 
-};
 
 
 /*** function declarations ***/
 
 /* helpers */
-static int sfs_ensure_block(struct super_block *sb, struct sfs_mount_config *config,
-                             __le64 *ptr_field, bool create, __u64 *out_block, bool *out_dirty);
-static int sfs_resolve_in_table(struct super_block *sb, struct sfs_mount_config *config,
-                                 __u64 table_block, __u64 idx, bool create,
-                                 bool zero_new_block, __u64 *out_phys);
-static void sfs_free_indirect_table(struct super_block *sb, struct sfs_mount_config *config,
-                                     __u64 table_block, bool entries_are_tables);
-
-
-static bool sfs_dir_nblocks_sane(struct super_block *sb, __u64 nblocks, unsigned int ino);
-
-static int sfs_resolve_block(struct super_block *sb, struct sfs_mount_config *config,
-                              struct sfs_inode *disk_ino, __u64 blk_idx, bool create,
-                              __u64 *out_phys, bool *out_dirty);
-
-static void sfs_free_data_block(struct sfs_mount_config *config, __u64 rel_block);
-
-static void sfs_free_inode_blocks(struct super_block *sb, struct sfs_mount_config *config,
+void sfs_free_inode_blocks(struct super_block *sb, struct sfs_mount_config *config,
                                    struct sfs_inode *disk_ino);
 
-
-static bool sfs_dir_is_empty(struct super_block *sb, struct sfs_mount_config *config,
-							struct sfs_inode *dir_disk);
-static int sfs_dir_add(struct super_block *sb, struct sfs_mount_config *config,
-                        struct sfs_inode *dir_disk,
-						const char *name, size_t namelen, unsigned int ino);
-static int sfs_dir_remove(struct super_block *sb, struct sfs_mount_config *config,
-                        	struct sfs_inode *dir_disk, const char *name, size_t namelen);
-
-static int sfs_dir_find(struct super_block *sb, struct sfs_mount_config *config,
-                         struct sfs_inode *dir_disk, const char *name, size_t namelen,
-                         unsigned int *out_ino);
 
 static struct inode* sfs_lookup_inode(struct super_block *sb, unsigned int inode_number);
 struct sfs_super* sfs_get_super (struct super_block *sb);
@@ -99,10 +66,6 @@ static int sfs_build_free_lists(struct super_block *sb, struct sfs_mount_config 
 
 static int sfs_build_data_bitmap(struct super_block *sb, struct sfs_mount_config *config);
 static long sfs_alloc_inode_slot(struct sfs_mount_config *config);
-static long sfs_alloc_data_block(struct sfs_mount_config *config);
-static void sfs_free_data_block(struct sfs_mount_config *config, __u64 rel_block);
-static int sfs_sync_bitmap_bit(struct super_block *sb, struct sfs_mount_config *config,
-                                __u64 rel_block, bool set);
 
 
 
@@ -282,7 +245,7 @@ int sfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	}
 
 
-	sb->s_maxbytes = (loff_t)SFS_MAX_FILE_BLOCKS * SFS_BLOCK_SIZE;
+	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_op = &sfs_super_operations;
 	sb->s_flags |= SB_NOATIME;
 
@@ -344,7 +307,9 @@ static int sfs_write_inode
 
 
 	if (!S_ISDIR(in->i_mode))
-		disk_ino.file_size = cpu_to_le64(i_size_read(in));	disk_ino.mode = cpu_to_le32(in->i_mode & 07777);
+		disk_ino.file_size = cpu_to_le64(i_size_read(in));
+		
+	disk_ino.mode = cpu_to_le32(in->i_mode & 07777);
 	disk_ino.uid = cpu_to_le32(from_kuid(&init_user_ns, in->i_uid));
 	disk_ino.gid = cpu_to_le32(from_kgid(&init_user_ns, in->i_gid));
 	disk_ino.num_links = cpu_to_le32(in->i_nlink);
@@ -396,15 +361,18 @@ static void sfs_evict_inode(struct inode *inode)
 		down_write(&config->lock);
 		if (sfs_read_disk_inode(sb, inode->i_ino, &disk_ino) == 0) {
 			__u32 mode = le32_to_cpu(disk_ino.mode);
-			if (S_ISREG(mode) || S_ISLNK(mode) || S_ISDIR(mode))
+
+			if (S_ISREG(mode) || S_ISLNK(mode))
 				sfs_free_inode_blocks(sb, config, &disk_ino);
+			else if (S_ISDIR(mode))
+				sfs_free_dir_index(sb, config, le64_to_cpu(disk_ino.index_block));
+
 			memset(&disk_ino, 0, sizeof(disk_ino));
 			sfs_write_disk_inode(sb, inode->i_ino, &disk_ino);
 			config->inode_free_stack[config->inode_free_count++] = inode->i_ino;
 		}
 		up_write(&config->lock);
 	}
-
 	clear_inode(inode);
 }
 
@@ -463,6 +431,7 @@ static int sfs_truncate_blocks(struct inode *inode, loff_t new_size)
 	__u64 data_start = le64_to_cpu(config->super.data_start_block);
 	struct sfs_inode disk_ino;
 	__u64 new_blocks = DIV_ROUND_UP(new_size, sb->s_blocksize);
+	__u64 cur_ovf;
 	int i, ret;
 
 	down_write(&config->lock);
@@ -471,119 +440,78 @@ static int sfs_truncate_blocks(struct inode *inode, loff_t new_size)
 		return -EIO;
 	}
 
-	/* double-indirect range */
-	{
-		__u64 dbl = le64_to_cpu(disk_ino.double_indirect);
-		__u64 dbl_base = SFS_DIRECT_BLOCKS + SFS_PTRS_PER_INDIRECT;
+	for (i = 0; i < SFS_INLINE_EXTENTS; i++) {
+		struct sfs_extent *e = &disk_ino.extents[i];
+		__u64 len = le32_to_cpu(e->length);
+		__u64 fb = le32_to_cpu(e->file_block);
+		__u64 blk = le64_to_cpu(e->start_block);
 
-		if (dbl && new_blocks <= dbl_base) {
-			sfs_free_indirect_table(sb, config, dbl, true);
-			sfs_free_data_block(config, dbl - data_start);
-			sfs_sync_bitmap_bit(sb, config, dbl - data_start, false);
-			disk_ino.double_indirect = 0;
-		} else if (dbl && new_blocks < dbl_base + SFS_DOUBLE_PTRS_PER_INDIRECT) {
-			__u64 keep_idx = new_blocks - dbl_base;
-			__u64 keep_outer = keep_idx / SFS_PTRS_PER_INDIRECT;
-			__u64 keep_inner = keep_idx % SFS_PTRS_PER_INDIRECT;
-			struct buffer_head *obh = sb_bread(sb, dbl);
-
-			if (obh) {
-				__le64 *outer = (__le64 *)obh->b_data;
-				bool outer_changed = false;
-				__u64 o;
-
-				for (o = SFS_PTRS_PER_INDIRECT - 1; o > keep_outer; o--) {
-					__u64 inner_blk = le64_to_cpu(outer[o]);
-					if (inner_blk) {
-						sfs_free_indirect_table(sb, config, inner_blk, false);
-						sfs_free_data_block(config, inner_blk - data_start);
-						sfs_sync_bitmap_bit(sb, config, inner_blk - data_start, false);
-						outer[o] = 0;
-						outer_changed = true;
-					}
-					cond_resched();
-				}
-
-				{
-					__u64 inner_blk = le64_to_cpu(outer[keep_outer]);
-					if (inner_blk) {
-						struct buffer_head *ibh = sb_bread(sb, inner_blk);
-						if (ibh) {
-							__le64 *inner = (__le64 *)ibh->b_data;
-							bool inner_changed = false;
-							__u64 ii = SFS_PTRS_PER_INDIRECT;
-							while (ii-- > keep_inner) {
-								__u64 blk = le64_to_cpu(inner[ii]);
-								if (blk) {
-									sfs_free_data_block(config, blk - data_start);
-									sfs_sync_bitmap_bit(sb, config, blk - data_start, false);
-									inner[ii] = 0;
-									inner_changed = true;
-								}
-							}
-							if (inner_changed)
-								mark_buffer_dirty(ibh);
-							brelse(ibh);
-						}
-					}
-				}
-				if (outer_changed)
-					mark_buffer_dirty(obh);
-				brelse(obh);
+		if (len == 0)
+			continue;
+		if (fb >= new_blocks) {
+			__u64 j;
+			for (j = 0; j < len; j++) {
+				sfs_free_data_block(config, blk + j - data_start);
+				sfs_sync_bitmap_bit(sb, config, blk + j - data_start, false);
 			}
+			memset(e, 0, sizeof(*e));
+		} else if (fb + len > new_blocks) {
+			__u64 keep = new_blocks - fb;
+			__u64 j;
+			for (j = keep; j < len; j++) {
+				sfs_free_data_block(config, blk + j - data_start);
+				sfs_sync_bitmap_bit(sb, config, blk + j - data_start, false);
+			}
+			e->length = cpu_to_le32(keep);
 		}
 	}
 
-	__u64 indirect = le64_to_cpu(disk_ino.indirect);
-	if (new_blocks <= SFS_DIRECT_BLOCKS) {
-		if (indirect) {
-			struct buffer_head *ibh = sb_bread(sb, indirect);
-			if (ibh) {
-				__le64 *ptrs = (__le64 *)ibh->b_data;
-				int p;
-				for (p = 0; p < SFS_PTRS_PER_INDIRECT; p++) {
-					__u64 blk = le64_to_cpu(ptrs[p]);
-					if (blk) {
-						sfs_free_data_block(config, blk - data_start);
-						sfs_sync_bitmap_bit(sb, config, blk - data_start, false);
-					}
-				}
-				brelse(ibh);
-			}
-			sfs_free_data_block(config, indirect - data_start);
-			sfs_sync_bitmap_bit(sb, config, indirect - data_start, false);
-			disk_ino.indirect = 0;
-		}
-	} else if (indirect && new_blocks < SFS_DIRECT_BLOCKS + SFS_PTRS_PER_INDIRECT) {
-		struct buffer_head *ibh = sb_bread(sb, indirect);
-		if (ibh) {
-			__le64 *ptrs = (__le64 *)ibh->b_data;
-			__u64 keep = new_blocks - SFS_DIRECT_BLOCKS;
-			int p;
-			bool changed = false;
-			for (p = SFS_PTRS_PER_INDIRECT - 1; p >= (int)keep; p--) {
-				__u64 blk = le64_to_cpu(ptrs[p]);
-				if (blk) {
-					sfs_free_data_block(config, blk - data_start);
-					sfs_sync_bitmap_bit(sb, config, blk - data_start, false);
-					ptrs[p] = 0;
-					changed = true;
-				}
-			}
-			if (changed)
-				mark_buffer_dirty(ibh);
-			brelse(ibh);
-		}
-	}
+	cur_ovf = le64_to_cpu(disk_ino.extent_overflow);
+	while (cur_ovf) {
+		struct buffer_head *bh = sb_bread(sb, cur_ovf);
+		struct sfs_extent *ents;
+		unsigned int s;
+		__u64 next;
+		bool changed = false;
 
-	for (i = SFS_DIRECT_BLOCKS - 1; i >= (int)new_blocks; i--) {
-		__u64 blk = le64_to_cpu(disk_ino.direct[i]);
-		if (blk) {
-			sfs_free_data_block(config, blk - data_start);
-			sfs_sync_bitmap_bit(sb, config, blk - data_start, false);
-			disk_ino.direct[i] = 0;
+		if (!bh)
+			break;
+		ents = (struct sfs_extent *)bh->b_data;
+		for (s = 0; s < SFS_EXTENTS_PER_OVERFLOW_BLOCK - 1; s++) {
+			__u64 len = le32_to_cpu(ents[s].length);
+			__u64 fb = le32_to_cpu(ents[s].file_block);
+			__u64 blk = le64_to_cpu(ents[s].start_block);
+			if (len == 0)
+				continue;
+			if (fb >= new_blocks) {
+				__u64 j;
+				for (j = 0; j < len; j++) {
+					sfs_free_data_block(config, blk + j - data_start);
+					sfs_sync_bitmap_bit(sb, config, blk + j - data_start, false);
+				}
+				memset(&ents[s], 0, sizeof(ents[s]));
+				changed = true;
+			} else if (fb + len > new_blocks) {
+				__u64 keep = new_blocks - fb;
+				__u64 j;
+				for (j = keep; j < len; j++) {
+					sfs_free_data_block(config, blk + j - data_start);
+					sfs_sync_bitmap_bit(sb, config, blk + j - data_start, false);
+				}
+				ents[s].length = cpu_to_le32(keep);
+				changed = true;
+			}
 		}
+		next = le64_to_cpu(ents[SFS_EXTENTS_PER_OVERFLOW_BLOCK - 1].start_block);
+		if (changed)
+			mark_buffer_dirty(bh);
+		brelse(bh);
+		cur_ovf = next;
+		cond_resched();
 	}
+	/* Note: fully-emptied overflow blocks are left allocated (their
+	 * slots are all zero, so they're harmlessly skipped on future scans)
+	 * rather than being unlinked and freed - a known simplification. */
 
 	disk_ino.file_size = cpu_to_le64(new_size);
 	ret = sfs_write_disk_inode(sb, inode->i_ino, &disk_ino) ? -EIO : 0;
@@ -674,73 +602,102 @@ static struct inode* sfs_lookup_inode
 
 /* file_operations callbacks definitions */
 
-static int sfs_dop_iterate_shared (struct file *file, struct dir_context *ctx) {
+static int sfs_dop_iterate_shared(struct file *file, struct dir_context *ctx)
+{
 	struct inode *dir = file_inode(file);
 	struct super_block *sb = dir->i_sb;
 	struct sfs_mount_config *config = (struct sfs_mount_config*) sb->s_fs_info;
 	struct sfs_inode dir_disk;
-	__u64 nblocks, pos, b;
+	struct buffer_head *ibh;
+	__le64 *buckets;
+	__u64 raw, start_bucket, start_chain, start_slot;
+	unsigned int bucket;
 
 	if (!dir_emit_dots(file, ctx))
 		return 0;
 
 	down_read(&config->lock);
-	if (sfs_read_disk_inode(sb, dir->i_ino, &dir_disk)) {
+	if (sfs_read_disk_inode(sb, dir->i_ino, &dir_disk) || !dir_disk.index_block) {
+		up_read(&config->lock);
+		return 0;
+	}
+
+	ibh = sb_bread(sb, le64_to_cpu(dir_disk.index_block));
+	if (!ibh) {
 		up_read(&config->lock);
 		return -EIO;
 	}
-	nblocks = DIV_ROUND_UP(le64_to_cpu(dir_disk.file_size), SFS_BLOCK_SIZE);
-	if (!sfs_dir_nblocks_sane(sb, nblocks, dir->i_ino))
-		return -EIO;
-	pos = ctx->pos - 2;
+	buckets = (__le64 *)ibh->b_data;
 
-	for (b = pos / SFS_DIRENTS_PER_BLOCK; b < nblocks; b++) {
-		__u64 phys; bool dirty;
-		struct buffer_head *bh;
-		struct sfs_dirent *ents;
-		unsigned int s, s_start;
+	raw = ctx->pos - 2;
+	start_bucket = raw >> SFS_DIR_POS_BUCKET_SHIFT;
+	start_chain = (raw >> SFS_DIR_POS_CHAIN_SHIFT) & SFS_DIR_POS_MASK;
+	start_slot = raw & SFS_DIR_POS_MASK;
+
+	for (bucket = start_bucket; bucket < SFS_DIR_INDEX_BUCKETS; bucket++) {
+		__u64 leaf = le64_to_cpu(buckets[bucket]);
+		__u64 chain_hop = 0, skip_hops = (bucket == start_bucket) ? start_chain : 0;
 		bool stop = false;
 
-		if (sfs_resolve_block(sb, config, &dir_disk, b, false, &phys, &dirty) || !phys)
-			continue;
-		bh = sb_bread(sb, phys);
-		if (!bh)
-			continue;
-		ents = (struct sfs_dirent *)bh->b_data;
-		s_start = (b == pos / SFS_DIRENTS_PER_BLOCK) ? (unsigned int)(pos % SFS_DIRENTS_PER_BLOCK) : 0;
-
-		for (s = s_start; s < SFS_DIRENTS_PER_BLOCK; s++) {
-			unsigned int ino, namelen;
-			struct sfs_inode child;
-			unsigned char type;
-
-			if (le64_to_cpu(ents[s].inode) == 0)
-				continue;
-			ino = (unsigned int)le64_to_cpu(ents[s].inode);
-			if (sfs_read_disk_inode(sb, ino, &child))
-				continue;
-
-			namelen = strnlen(ents[s].name, sizeof(ents[s].name));
-			type = S_ISDIR(le32_to_cpu(child.mode)) ? DT_DIR : DT_REG;
-
-			/* Set pos to THIS entry first, so a failed dir_emit (buffer
-			 * full) correctly leaves the cursor here to retry next call. */
-			ctx->pos = b * SFS_DIRENTS_PER_BLOCK + s + 2;
-
-			if (!dir_emit(ctx, ents[s].name, namelen, ino, type)) {
-				stop = true;
-				break;
-			}
-
-			/* Emit succeeded - advance past this entry so the next
-			 * call resumes at s+1, not at this same slot again. */
-			ctx->pos = b * SFS_DIRENTS_PER_BLOCK + s + 1 + 2;
+		while (skip_hops-- && leaf) {
+			struct buffer_head *lbh = sb_bread(sb, leaf);
+			if (!lbh) { leaf = 0; break; }
+			leaf = le64_to_cpu(((struct sfs_dirblock_header *)lbh->b_data)->next);
+			brelse(lbh);
+			chain_hop++;
 		}
-		brelse(bh);
+
+		while (leaf) {
+			struct buffer_head *lbh = sb_bread(sb, leaf);
+			struct sfs_dirblock_header *hdr;
+			struct sfs_dirent *ents;
+			unsigned int s, s_start;
+			__u64 next;
+
+			if (!lbh) { stop = true; break; }
+			hdr = (struct sfs_dirblock_header *)lbh->b_data;
+			ents = (struct sfs_dirent *)(lbh->b_data + sizeof(*hdr));
+			s_start = (bucket == start_bucket && chain_hop == start_chain) ? (unsigned int)start_slot : 0;
+
+			for (s = s_start; s < SFS_DIRENTS_PER_LEAF; s++) {
+				unsigned int ino, namelen;
+				struct sfs_inode child;
+				unsigned char type;
+
+				if (le64_to_cpu(ents[s].inode) == 0)
+					continue;
+				ino = (unsigned int)le64_to_cpu(ents[s].inode);
+				if (sfs_read_disk_inode(sb, ino, &child))
+					continue;
+
+				namelen = strnlen(ents[s].name, sizeof(ents[s].name));
+				type = S_ISDIR(le32_to_cpu(child.mode)) ? DT_DIR : DT_REG;
+
+				ctx->pos = ((__u64)bucket << SFS_DIR_POS_BUCKET_SHIFT) |
+						       (chain_hop << SFS_DIR_POS_CHAIN_SHIFT ) | s;
+				ctx->pos += 2;
+
+				if (!dir_emit(ctx, ents[s].name, namelen, ino, type)) {
+					stop = true;
+					break;
+				}
+
+				ctx->pos = ((__u64)bucket << SFS_DIR_POS_BUCKET_SHIFT) |
+           					   (chain_hop << SFS_DIR_POS_CHAIN_SHIFT ) | (s + 1);
+				ctx->pos += 2;
+			}
+			next = le64_to_cpu(hdr->next);
+			brelse(lbh);
+			if (stop)
+				break;
+			leaf = next;
+			chain_hop++;
+		}
 		if (stop)
 			break;
 	}
 
+	brelse(ibh);
 	up_read(&config->lock);
 	return 0;
 }
@@ -1088,6 +1045,11 @@ static int sfs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry
 	}
 
 	memset(&disk_ino, 0, sizeof(disk_ino));
+	{
+		__u64 data_start = le64_to_cpu(config->super.data_start_block);
+		__u64 idxb = le64_to_cpu(dir_disk.index_block);
+		disk_ino.alloc_hint = cpu_to_le32(idxb ? (__u32)(idxb - data_start) : 0);
+	}
 	disk_ino.mode = cpu_to_le32(S_IFLNK | 0777);
 	disk_ino.num_links = cpu_to_le32(1);
 	disk_ino.access_time = disk_ino.modified_time =
@@ -1109,7 +1071,7 @@ static int sfs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry
 			__u64 phys; bool dirty;
 			struct buffer_head *bh;
 			size_t chunk;
-			int ret = sfs_resolve_block(dir->i_sb, config, &disk_ino, blk_idx, true, &phys, &dirty);
+			int ret = sfs_resolve_extent_block(dir->i_sb, config, &disk_ino, blk_idx, true, &phys, &dirty);
 			if (ret) {
 				config->inode_free_stack[config->inode_free_count++] = (unsigned int)slot;
 				up_write(&config->lock);
@@ -1176,166 +1138,6 @@ static int sfs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry
 }
 
 
-/* directory entry helpers */
-
-static int sfs_dir_find(struct super_block *sb, struct sfs_mount_config *config,
-                         struct sfs_inode *dir_disk, const char *name, size_t namelen,
-                         unsigned int *out_ino)
-{
-	__u64 nblocks = DIV_ROUND_UP(le64_to_cpu(dir_disk->file_size), SFS_BLOCK_SIZE);
-	__u64 b;
-
-	for (b = 0; b < nblocks; b++) {
-		__u64 phys; bool dirty;
-		struct buffer_head *bh;
-		struct sfs_dirent *ents;
-		unsigned int s;
-
-		if (sfs_resolve_block(sb, config, dir_disk, b, false, &phys, &dirty) || !phys)
-			continue;
-		bh = sb_bread(sb, phys);
-		if (!bh)
-			continue;
-		ents = (struct sfs_dirent *)bh->b_data;
-		for (s = 0; s < SFS_DIRENTS_PER_BLOCK; s++) {
-			size_t enl;
-			if (le64_to_cpu(ents[s].inode) == 0)
-				continue;
-			enl = strnlen(ents[s].name, sizeof(ents[s].name));
-			if (enl == namelen && memcmp(ents[s].name, name, namelen) == 0) {
-				*out_ino = (unsigned int)le64_to_cpu(ents[s].inode);
-				brelse(bh);
-				return 0;
-			}
-		}
-		brelse(bh);
-	}
-	return -ENOENT;
-}
-
-/* dir_disk may be mutated (file_size grows); caller must persist it after */
-static int sfs_dir_add(struct super_block *sb, struct sfs_mount_config *config,
-                        struct sfs_inode *dir_disk, const char *name, size_t namelen, unsigned int ino)
-{
-
-	__u64 nblocks = DIV_ROUND_UP(le64_to_cpu(dir_disk->file_size), SFS_BLOCK_SIZE);
-	if (!sfs_dir_nblocks_sane(sb, nblocks, ino))
-		return -EIO;
-	__u64 b, phys; bool dirty;
-	struct buffer_head *bh;
-	struct sfs_dirent *ents;
-	unsigned int s;
-	int ret;
-
-	for (b = 0; b < nblocks; b++) {
-		if (sfs_resolve_block(sb, config, dir_disk, b, false, &phys, &dirty) || !phys)
-			continue;
-		bh = sb_bread(sb, phys);
-		if (!bh)
-			continue;
-		ents = (struct sfs_dirent *)bh->b_data;
-		for (s = 0; s < SFS_DIRENTS_PER_BLOCK; s++) {
-			if (le64_to_cpu(ents[s].inode) == 0) {
-				memset(ents[s].name, 0, sizeof(ents[s].name));
-				memcpy(ents[s].name, name, namelen);
-				ents[s].inode = cpu_to_le64(ino);
-				mark_buffer_dirty(bh);
-				brelse(bh);
-				return 0;
-			}
-		}
-		brelse(bh);
-		cond_resched();
-	}
-
-	ret = sfs_resolve_block(sb, config, dir_disk, nblocks, true, &phys, &dirty);
-	if (ret)
-		return ret;
-	bh = sb_bread(sb, phys);
-	if (!bh)
-		return -EIO;
-	memset(bh->b_data, 0, SFS_BLOCK_SIZE);
-	ents = (struct sfs_dirent *)bh->b_data;
-	memcpy(ents[0].name, name, namelen);
-	ents[0].inode = cpu_to_le64(ino);
-	mark_buffer_dirty(bh);
-	brelse(bh);
-
-	dir_disk->file_size = cpu_to_le64((nblocks + 1) * SFS_BLOCK_SIZE);
-	return 0;
-}
-
-static int sfs_dir_remove(struct super_block *sb, struct sfs_mount_config *config,
-                           struct sfs_inode *dir_disk, const char *name, size_t namelen)
-{
-	__u64 nblocks = DIV_ROUND_UP(le64_to_cpu(dir_disk->file_size), SFS_BLOCK_SIZE);
-	if (!sfs_dir_nblocks_sane(sb, nblocks, 0))
-		return -EIO;
-
-	__u64 b;
-	
-
-	for (b = 0; b < nblocks; b++) {
-		__u64 phys; bool dirty;
-		struct buffer_head *bh;
-		struct sfs_dirent *ents;
-		unsigned int s;
-
-		if (sfs_resolve_block(sb, config, dir_disk, b, false, &phys, &dirty) || !phys)
-			continue;
-		bh = sb_bread(sb, phys);
-		if (!bh)
-			continue;
-		ents = (struct sfs_dirent *)bh->b_data;
-		for (s = 0; s < SFS_DIRENTS_PER_BLOCK; s++) {
-			size_t enl;
-			if (le64_to_cpu(ents[s].inode) == 0)
-				continue;
-			enl = strnlen(ents[s].name, sizeof(ents[s].name));
-			if (enl == namelen && memcmp(ents[s].name, name, namelen) == 0) {
-				memset(&ents[s], 0, sizeof(ents[s]));
-				mark_buffer_dirty(bh);
-				brelse(bh);
-				return 0;
-			}
-		}
-		brelse(bh);
-		cond_resched();
-	}
-	return -ENOENT;
-}
-
-static bool sfs_dir_is_empty(struct super_block *sb, struct sfs_mount_config *config, struct sfs_inode *dir_disk)
-{
-	__u64 nblocks = DIV_ROUND_UP(le64_to_cpu(dir_disk->file_size), SFS_BLOCK_SIZE);
-	if (!sfs_dir_nblocks_sane(sb, nblocks, 0))
-		return false;
-	__u64 b;
-
-	for (b = 0; b < nblocks; b++) {
-		__u64 phys; bool dirty;
-		struct buffer_head *bh;
-		struct sfs_dirent *ents;
-		unsigned int s;
-
-		if (sfs_resolve_block(sb, config, dir_disk, b, false, &phys, &dirty) || !phys)
-			continue;
-		bh = sb_bread(sb, phys);
-		if (!bh)
-			continue;
-		ents = (struct sfs_dirent *)bh->b_data;
-		for (s = 0; s < SFS_DIRENTS_PER_BLOCK; s++) {
-			if (le64_to_cpu(ents[s].inode) != 0) {
-				brelse(bh);
-				return false;
-			}
-		}
-		brelse(bh);
-		cond_resched();
-	}
-	return true;
-}
-
 static int sfs_create(struct mnt_idmap *idmap, struct inode *dir,
                       struct dentry *d, umode_t mode, bool excl) {
 	struct sfs_mount_config *config = (struct sfs_mount_config*) dir->i_sb->s_fs_info;
@@ -1368,6 +1170,11 @@ static int sfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	}
 
 	memset(&disk_ino, 0, sizeof(disk_ino));
+	{
+		__u64 data_start = le64_to_cpu(config->super.data_start_block);
+		__u64 idxb = le64_to_cpu(dir_disk.index_block);
+		disk_ino.alloc_hint = cpu_to_le32(idxb ? (__u32)(idxb - data_start) : 0);
+	}
 	disk_ino.mode = cpu_to_le32(S_IFREG | (mode & 07777));
 	disk_ino.num_links = cpu_to_le32(1);
 	disk_ino.access_time = disk_ino.modified_time =
@@ -1446,7 +1253,7 @@ static const char *sfs_get_link(struct dentry *dentry, struct inode *inode, stru
 		struct buffer_head *bh;
 		size_t chunk;
 
-		if (sfs_resolve_block(sb, config, &disk_ino, blk_idx, false, &phys, &dirty) || !phys) {
+		if (sfs_resolve_extent_block(sb, config, &disk_ino, blk_idx, false, &phys, &dirty) || !phys) {
 			up_read(&config->lock);
 			kfree(buf);
 			return ERR_PTR(-EIO);
@@ -1516,7 +1323,7 @@ static int sfs_get_block (struct inode *inode, sector_t iblock,
 		return -EIO;
 	}
 
-	ret = sfs_resolve_block(sb, config, &disk_ino, iblock, create, &phys, &dirty);
+	ret = sfs_resolve_extent_block(sb, config, &disk_ino, iblock, create, &phys, &dirty);
 	if (ret) {
 		up_write(&config->lock);
 		return ret;
@@ -1540,155 +1347,7 @@ static int sfs_get_block (struct inode *inode, sector_t iblock,
 
 
 /*** helper definitions ***/
-/* Ensures *ptr_field names an allocated, zeroed block, allocating one if
- * unset and create is true. Used for the top-level indirect and
- * double_indirect fields, both of which always point at pointer tables. */
-static int sfs_ensure_block(struct super_block *sb, struct sfs_mount_config *config,
-                             __le64 *ptr_field, bool create, __u64 *out_block, bool *out_dirty)
-{
-	__u64 data_start = le64_to_cpu(config->super.data_start_block);
-	__u64 blk = le64_to_cpu(*ptr_field);
 
-	if (!blk) {
-		struct buffer_head *bh;
-		long rel;
-		if (!create) {
-			*out_block = 0;
-			return 0;
-		}
-		rel = sfs_alloc_data_block(config);
-		if (rel < 0)
-			return -ENOSPC;
-		blk = data_start + rel;
-		sfs_sync_bitmap_bit(sb, config, rel, true);
-		*ptr_field = cpu_to_le64(blk);
-		*out_dirty = true;
-
-		bh = sb_bread(sb, blk);
-		if (!bh)
-			return -EIO;
-		memset(bh->b_data, 0, sb->s_blocksize);
-		mark_buffer_dirty(bh);
-		brelse(bh);
-	}
-	*out_block = blk;
-	return 0;
-}
-
-/* Reads/writes a single pointer slot at index `idx` inside the pointer
- * table stored in block `table_block`, allocating the pointed-to block
- * on demand if create is true. If zero_new_block is true, the newly
- * allocated block is itself zeroed - required when it will be used as
- * another pointer table (the outer level of double-indirect), not
- * needed for a leaf data block (the VFS write path handles that). */
-static int sfs_resolve_in_table(struct super_block *sb, struct sfs_mount_config *config,
-                                 __u64 table_block, __u64 idx, bool create,
-                                 bool zero_new_block, __u64 *out_phys)
-{
-	struct buffer_head *bh = sb_bread(sb, table_block);
-	__le64 *ptrs;
-	__u64 blk;
-
-	if (!bh)
-		return -EIO;
-	ptrs = (__le64 *)bh->b_data;
-	blk = le64_to_cpu(ptrs[idx]);
-
-	if (!blk) {
-		long rel;
-		if (!create) {
-			brelse(bh);
-			*out_phys = 0;
-			return 0;
-		}
-		rel = sfs_alloc_data_block(config);
-		if (rel < 0) {
-			brelse(bh);
-			return -ENOSPC;
-		}
-		blk = le64_to_cpu(config->super.data_start_block) + rel;
-		sfs_sync_bitmap_bit(sb, config, rel, true);
-		ptrs[idx] = cpu_to_le64(blk);
-		mark_buffer_dirty(bh);
-
-		if (zero_new_block) {
-			struct buffer_head *nbh = sb_bread(sb, blk);
-			if (!nbh) {
-				brelse(bh);
-				return -EIO;
-			}
-			memset(nbh->b_data, 0, sb->s_blocksize);
-			mark_buffer_dirty(nbh);
-			brelse(nbh);
-		}
-	}
-	brelse(bh);
-	*out_phys = blk;
-	return 0;
-}
-
-static int sfs_resolve_block(struct super_block *sb, struct sfs_mount_config *config,
-                              struct sfs_inode *disk_ino, __u64 blk_idx, bool create,
-                              __u64 *out_phys, bool *out_dirty)
-{
-	*out_dirty = false;
-	*out_phys = 0;
-
-	if (blk_idx < SFS_DIRECT_BLOCKS) {
-		__u64 data_start = le64_to_cpu(config->super.data_start_block);
-		__u64 blk = le64_to_cpu(disk_ino->direct[blk_idx]);
-		if (!blk) {
-			long rel;
-			if (!create)
-				return 0;
-			rel = sfs_alloc_data_block(config);
-			if (rel < 0)
-				return -ENOSPC;
-			blk = data_start + rel;
-			sfs_sync_bitmap_bit(sb, config, rel, true);
-			disk_ino->direct[blk_idx] = cpu_to_le64(blk);
-			*out_dirty = true;
-		}
-		*out_phys = blk;
-		return 0;
-	}
-	blk_idx -= SFS_DIRECT_BLOCKS;
-
-	if (blk_idx < SFS_PTRS_PER_INDIRECT) {
-		__u64 table_block;
-		int ret = sfs_ensure_block(sb, config, &disk_ino->indirect, create, &table_block, out_dirty);
-		if (ret)
-			return ret;
-		if (!table_block)
-			return 0;
-		return sfs_resolve_in_table(sb, config, table_block, blk_idx, create, false, out_phys);
-	}
-	blk_idx -= SFS_PTRS_PER_INDIRECT;
-
-	if (blk_idx < SFS_DOUBLE_PTRS_PER_INDIRECT) {
-		__u64 outer_idx = blk_idx / SFS_PTRS_PER_INDIRECT;
-		__u64 inner_idx = blk_idx % SFS_PTRS_PER_INDIRECT;
-		__u64 dbl_table_block, inner_table_block;
-		int ret;
-
-		ret = sfs_ensure_block(sb, config, &disk_ino->double_indirect, create, &dbl_table_block, out_dirty);
-		if (ret)
-			return ret;
-		if (!dbl_table_block)
-			return 0;
-
-		/* zero_new_block=true: this slot's value is itself a table */
-		ret = sfs_resolve_in_table(sb, config, dbl_table_block, outer_idx, create, true, &inner_table_block);
-		if (ret)
-			return ret;
-		if (!inner_table_block)
-			return 0;
-
-		return sfs_resolve_in_table(sb, config, inner_table_block, inner_idx, create, false, out_phys);
-	}
-
-	return -EFBIG;
-}
 
 struct sfs_super* sfs_get_super(struct super_block *sb) {
 	struct sfs_mount_config *config = (struct sfs_mount_config*) sb->s_fs_info;
@@ -1697,39 +1356,60 @@ struct sfs_super* sfs_get_super(struct super_block *sb) {
 	return &config->super;
 }
 
-static void sfs_free_inode_blocks(struct super_block *sb, struct sfs_mount_config *config,
+void sfs_free_inode_blocks(struct super_block *sb, struct sfs_mount_config *config,
                                    struct sfs_inode *disk_ino)
 {
 	__u64 data_start = le64_to_cpu(config->super.data_start_block);
+	__u64 cur_ovf;
 	int i;
 
-	for (i = 0; i < SFS_DIRECT_BLOCKS; i++) {
-		__u64 blk = le64_to_cpu(disk_ino->direct[i]);
-		if (blk) {
-			sfs_free_data_block(config, blk - data_start);
-			sfs_sync_bitmap_bit(sb, config, blk - data_start, false);
+	for (i = 0; i < SFS_INLINE_EXTENTS; i++) {
+		__u64 len = le32_to_cpu(disk_ino->extents[i].length);
+		__u64 blk = le64_to_cpu(disk_ino->extents[i].start_block);
+		__u64 j;
+		if (len == 0)
+			continue;
+		for (j = 0; j < len; j++) {
+			sfs_free_data_block(config, blk + j - data_start);
+			sfs_sync_bitmap_bit(sb, config, blk + j - data_start, false);
 		}
 	}
 
-	__u64 indirect = le64_to_cpu(disk_ino->indirect);
-	if (indirect) {
-		sfs_free_indirect_table(sb, config, indirect, false);
-		sfs_free_data_block(config, indirect - data_start);
-		sfs_sync_bitmap_bit(sb, config, indirect - data_start, false);
-	}
+	cur_ovf = le64_to_cpu(disk_ino->extent_overflow);
+	while (cur_ovf) {
+		struct buffer_head *bh = sb_bread(sb, cur_ovf);
+		struct sfs_extent *ents;
+		unsigned int s;
+		__u64 next, this_block = cur_ovf;
 
-	__u64 dbl = le64_to_cpu(disk_ino->double_indirect);
-	if (dbl) {
-		sfs_free_indirect_table(sb, config, dbl, true);
-		sfs_free_data_block(config, dbl - data_start);
-		sfs_sync_bitmap_bit(sb, config, dbl - data_start, false);
+		if (!bh)
+			return;
+		ents = (struct sfs_extent *)bh->b_data;
+		for (s = 0; s < SFS_EXTENTS_PER_OVERFLOW_BLOCK - 1; s++) {
+			__u64 len = le32_to_cpu(ents[s].length);
+			__u64 blk = le64_to_cpu(ents[s].start_block);
+			__u64 j;
+			if (len == 0)
+				continue;
+			for (j = 0; j < len; j++) {
+				sfs_free_data_block(config, blk + j - data_start);
+				sfs_sync_bitmap_bit(sb, config, blk + j - data_start, false);
+			}
+		}
+		next = le64_to_cpu(ents[SFS_EXTENTS_PER_OVERFLOW_BLOCK - 1].start_block);
+		brelse(bh);
+
+		sfs_free_data_block(config, this_block - data_start);
+		sfs_sync_bitmap_bit(sb, config, this_block - data_start, false);
+		cur_ovf = next;
+		cond_resched();
 	}
 }
 
 /* Frees every non-zero pointer in the table stored at table_block. If
  * entries_are_tables is true, each entry is itself a table whose own
  * (leaf) entries are freed first - used for the outer level of
- * double-indirect addressing. */
+ * double-indirect addressing.
 static void sfs_free_indirect_table(struct super_block *sb, struct sfs_mount_config *config,
                                      __u64 table_block, bool entries_are_tables)
 {
@@ -1755,6 +1435,7 @@ static void sfs_free_indirect_table(struct super_block *sb, struct sfs_mount_con
 	}
 	brelse(bh);
 }
+*/
 
 
 static int sfs_build_free_lists(struct super_block *sb, struct sfs_mount_config *config)
@@ -1784,7 +1465,7 @@ static long sfs_alloc_inode_slot(struct sfs_mount_config *config)
 	return config->inode_free_stack[--config->inode_free_count];
 }
 
-static int sfs_sync_bitmap_bit(struct super_block *sb, struct sfs_mount_config *config,
+int sfs_sync_bitmap_bit(struct super_block *sb, struct sfs_mount_config *config,
                                 __u64 rel_block, bool set)
 {
 	__u64 byte_off = rel_block / 8;
@@ -1836,30 +1517,52 @@ static int sfs_build_data_bitmap(struct super_block *sb, struct sfs_mount_config
 	return 0;
 }
 
-static long sfs_alloc_data_block(struct sfs_mount_config *config)
+
+long sfs_alloc_data_block_near(struct sfs_mount_config *config, __u64 hint_rel)
 {
-	unsigned long bit = find_first_zero_bit(config->data_bitmap, config->data_block_count);
-	if (bit >= config->data_block_count)
-		return -ENOSPC;
+	unsigned long bit;
+
+	if (hint_rel >= config->data_block_count)
+		hint_rel = 0;
+
+	bit = find_next_zero_bit(config->data_bitmap, config->data_block_count, hint_rel);
+	if (bit >= config->data_block_count) {
+		bit = find_first_zero_bit(config->data_bitmap, config->data_block_count);
+		if (bit >= config->data_block_count)
+			return -ENOSPC;
+	}
 	set_bit(bit, config->data_bitmap);
 	return (long)bit;
 }
 
-static void sfs_free_data_block(struct sfs_mount_config *config, __u64 rel_block)
+long sfs_alloc_data_block(struct sfs_mount_config *config)
+{
+	return sfs_alloc_data_block_near(config, 0);
+}
+
+bool sfs_block_free(struct sfs_mount_config *config, __u64 rel_block)
+{
+	if (rel_block >= config->data_block_count)
+		return false;
+	return !test_bit(rel_block, config->data_bitmap);
+}
+
+
+void sfs_free_data_block(struct sfs_mount_config *config, __u64 rel_block)
 {
 	clear_bit(rel_block, config->data_bitmap);
 }
 
 
-static bool sfs_dir_nblocks_sane(struct super_block *sb, __u64 nblocks, unsigned int ino)
-{
-	if (nblocks > SFS_MAX_FILE_BLOCKS) {
-		sfs_error_printk("CORRUPT: dir ino=%u has nblocks=%llu (max=%u) - refusing to scan\n",
-		                  ino, (unsigned long long)nblocks, (unsigned int)SFS_MAX_FILE_BLOCKS);
-		return false;
-	}
-	return true;
-}
+// static bool sfs_dir_nblocks_sane(struct super_block *sb, __u64 nblocks, unsigned int ino)
+// {
+// 	if (nblocks > SFS_MAX_FILE_BLOCKS) {
+// 		sfs_error_printk("CORRUPT: dir ino=%u has nblocks=%llu (max=%u) - refusing to scan\n",
+// 		                  ino, (unsigned long long)nblocks, (unsigned int)SFS_MAX_FILE_BLOCKS);
+// 		return false;
+// 	}
+// 	return true;
+// }
 
 
 /*** Module callbacks and setup ***/
