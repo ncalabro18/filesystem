@@ -16,10 +16,10 @@
 #include <sys/statfs.h>
 
 
-#include "/work/sfs/sfs.h"
+#include "/work/sfs/sfs_module.h"
 
 
-const char *EMPTY_STRING = "";
+static const char *EMPTY_STRING = "";
 
 char* validate_open_write_close_read ();
 char* validate_duplicate_detection ();
@@ -38,7 +38,7 @@ char* validate_rmdir_nonempty_fails();
 char* validate_name_length_boundary();
 char* validate_inode_table_exhaustion();
 char* validate_read_directory_fails();
-char* validate_max_file_size_boundary();
+// char* validate_max_file_size_boundary();
 
 char* validate_delete_size();
 
@@ -88,7 +88,7 @@ static char* (*tests[]) (void) = {
 	validate_name_length_boundary,
 	validate_inode_table_exhaustion,
 	validate_read_directory_fails,
-	validate_max_file_size_boundary,
+	// validate_max_file_size_boundary,
 	validate_delete_size,
 	validate_mkdir_exhaustion_and_reclaim,
 	validate_concurrent_create,
@@ -109,7 +109,6 @@ static char* (*tests[]) (void) = {
 	test_randomized_operations
 };
 
-#define NUM_TESTS (sizeof(tests) / sizeof(tests[0]))
 
 static const char *names[1028] = {
 	"validate_open_write_close_read",
@@ -129,7 +128,7 @@ static const char *names[1028] = {
 	"validate_name_length_boundary",
 	"validate_inode_table_exhaustion",
 	"validate_read_directory_fails",
-	"validate_max_file_size_boundary",
+	// "validate_max_file_size_boundary",
 	"validate_delete_size",
 	"validate_mkdir_exhaustion_and_reclaim",
 	"validate_concurrent_create",
@@ -156,13 +155,15 @@ static char error_message[1028];
 /* driver for test functions */
 int main (int argc, char **argv) {
 
+	int num_tests = sizeof(tests) / sizeof(tests[0]);
+
 	int error_count = 0;
 	
 	puts("TAP version 14");
-	printf("1..%ld\n", NUM_TESTS);
+	printf("1..%ld\n", num_tests);
 
 	
-	for (int i = 0; i < NUM_TESTS; i++) {
+	for (int i = 0; i < num_tests; i++) {
 		if (argc > 1 && chdir(argv[1]) != 0) {
 			perror("chdir to test target");
 			return 1;
@@ -667,47 +668,48 @@ char* validate_read_directory_fails() {
 	return NULL;
 }
 
+// disabling because files no longer have a max size. ill keep it in the file
+// in case a minimum validated file size proves useful
+// char* validate_max_file_size_boundary() {
+// 	const size_t max_blocks = SFS_MAX_FILE_BLOCKS;
+// 	const off_t last_byte_offset = (off_t)(max_blocks - 1) * SFS_BLOCK_SIZE;
+// 	const off_t past_boundary_offset = (off_t)max_blocks * SFS_BLOCK_SIZE;
 
-char* validate_max_file_size_boundary() {
-	const size_t max_blocks = SFS_MAX_FILE_BLOCKS;
-	const off_t last_byte_offset = (off_t)(max_blocks - 1) * SFS_BLOCK_SIZE;
-	const off_t past_boundary_offset = (off_t)max_blocks * SFS_BLOCK_SIZE;
+// 	int fd = open("sparse_max.txt", O_CREAT | O_WRONLY, 0644);
+// 	if (fd < 0) return "create failed";
 
-	int fd = open("sparse_max.txt", O_CREAT | O_WRONLY, 0644);
-	if (fd < 0) return "create failed";
+// 	/* Write into the very last valid block via double-indirect addressing,
+// 	 * without materializing everything before it. */
+// 	if (lseek(fd, last_byte_offset, SEEK_SET) != last_byte_offset) {
+// 		close(fd); unlink("sparse_max.txt");
+// 		return "lseek to last valid block failed";
+// 	}
+// 	if (write(fd, "X", 1) != 1) {
+// 		close(fd); unlink("sparse_max.txt");
+// 		return "write to last valid block failed - addressing did not reach max";
+// 	}
 
-	/* Write into the very last valid block via double-indirect addressing,
-	 * without materializing everything before it. */
-	if (lseek(fd, last_byte_offset, SEEK_SET) != last_byte_offset) {
-		close(fd); unlink("sparse_max.txt");
-		return "lseek to last valid block failed";
-	}
-	if (write(fd, "X", 1) != 1) {
-		close(fd); unlink("sparse_max.txt");
-		return "write to last valid block failed - addressing did not reach max";
-	}
+// 	struct stat st;
+// 	if (fstat(fd, &st) != 0 || (size_t)st.st_size != past_boundary_offset) {
+// 		close(fd); unlink("sparse_max.txt");
+// 		return "unexpected file size after writing last valid block";
+// 	}
 
-	struct stat st;
-	if (fstat(fd, &st) != 0 || (size_t)st.st_size != past_boundary_offset) {
-		close(fd); unlink("sparse_max.txt");
-		return "unexpected file size after writing last valid block";
-	}
+// 	/* One byte past the addressing ceiling must fail with EFBIG */
+// 	if (lseek(fd, past_boundary_offset, SEEK_SET) != past_boundary_offset) {
+// 		close(fd); unlink("sparse_max.txt");
+// 		return "lseek to boundary failed";
+// 	}
+// 	ssize_t overflow = write(fd, "X", 1);
+// 	int overflow_errno = errno;
+// 	close(fd);
+// 	unlink("sparse_max.txt");
 
-	/* One byte past the addressing ceiling must fail with EFBIG */
-	if (lseek(fd, past_boundary_offset, SEEK_SET) != past_boundary_offset) {
-		close(fd); unlink("sparse_max.txt");
-		return "lseek to boundary failed";
-	}
-	ssize_t overflow = write(fd, "X", 1);
-	int overflow_errno = errno;
-	close(fd);
-	unlink("sparse_max.txt");
+// 	if (overflow > 0) return "write past the addressing-imposed max size unexpectedly succeeded";
+// 	if (overflow_errno != EFBIG) return "write past max size failed with unexpected errno (expected EFBIG)";
 
-	if (overflow > 0) return "write past the addressing-imposed max size unexpectedly succeeded";
-	if (overflow_errno != EFBIG) return "write past max size failed with unexpected errno (expected EFBIG)";
-
-	return NULL;
-}
+// 	return NULL;
+// }
 
 
 /* validate after a file is deleted,
