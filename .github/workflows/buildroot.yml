@@ -1,4 +1,4 @@
-- name: Build Integration Image
+- name: Build
   uses: docker/build-push-action@v6
   with:
     context: .
